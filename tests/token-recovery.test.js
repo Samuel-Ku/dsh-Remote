@@ -44,6 +44,16 @@ test('读写失败或写后校验失败必须中止初始化，环境令牌不�
 })
 
 const panel = fs.readFileSync(path.join(__dirname, '../public/plugin.js'), 'utf8')
+const panelHtml = fs.readFileSync(path.join(__dirname, '../public/plugin.html'), 'utf8')
+const panelDictSrc = panelHtml
+  .slice(panelHtml.indexOf('window.PLUGIN_STR ='), panelHtml.indexOf('</script>', panelHtml.indexOf('window.PLUGIN_STR =')))
+  .replace('window.PLUGIN_STR =', 'PLUGIN_STR =')
+const PLUGIN_STR = vm.runInNewContext(panelDictSrc + '; PLUGIN_STR', {})
+const panelT = (key, vars) => {
+  let text = String(PLUGIN_STR.zh[key] ?? key)
+  if (vars) for (const [name, value] of Object.entries(vars)) text = text.split('{' + name + '}').join(String(value ?? ''))
+  return text
+}
 test('插件监听配置优先级兼容环境变量、文件与 IPv4 默认值', () => {
   const plugin = fs.readFileSync(path.join(__dirname, '../packages/plugin/index.mjs'), 'utf8')
   const hostCode = plugin.slice(plugin.indexOf('export function readGatewayHost()'), plugin.indexOf('function gatewayToken()')).replace('export ', '')
@@ -69,7 +79,7 @@ test('插件面板显示运行中认证异常，并报告 HTTP 200 中的操作�
   const renderCode = panel.slice(panel.indexOf('function render(st)'), panel.indexOf('async function load()'))
   const toggleCode = panel.slice(panel.indexOf('async function toggleGateway()'), panel.indexOf('async function copyToken()'))
   const api = vm.runInNewContext('let latest; ' + renderCode + toggleCode + '; ({render, toggleGateway})', {
-    $, text: (id, value) => { $(id).textContent = value }, Date,
+    $, t: panelT, text: (id, value) => { $(id).textContent = value }, Date,
     usageLoadedAt: Date.now(), renderUsage() {}, loadUsage() {}, busy: false, setBusy() {}, API: '/remote/admin/api',
     fetch: async (_url, options) => {
       assert.equal(JSON.parse(options.body).action, 'stop')
@@ -83,4 +93,13 @@ test('插件面板显示运行中认证异常，并报告 HTTP 200 中的操作�
   assert.equal($('plugin-toggle-label').textContent, '停止网关')
   await api.toggleGateway()
   assert.match($('plugin-error').textContent, /请手动重启网关/)
+})
+
+test('侧边栏面板中英文字典键一致且英文可展示', () => {
+  assert.deepEqual(Object.keys(PLUGIN_STR.en).sort(), Object.keys(PLUGIN_STR.zh).sort())
+  for (const [key, value] of Object.entries(PLUGIN_STR.en)) {
+    assert.ok(value && !/[一-鿿]/.test(value), key)
+  }
+  assert.equal(PLUGIN_STR.en.statusOk, 'All systems normal')
+  assert.equal(panelT('descOk', { devices: 2, reqs: 7 }), '2 台设备在线 · 最近请求 7 次')
 })

@@ -155,7 +155,7 @@ window.__ModuleLoader__.load({
       },
         loaded.current ? React.createElement('iframe', {
           src: '/remote/plugin.html',
-          title: 'DSH Remote 快速状态面板',
+          title: (typeof navigator !== 'undefined' && String(navigator.language || '').toLowerCase().startsWith('zh')) ? 'DSH Remote 快速状态面板' : 'DSH Remote quick status panel',
           sandbox: 'allow-scripts allow-same-origin allow-forms allow-modals allow-popups',
           style: { flex: 1, width: '100%', border: 'none', background: '#0b0e1a' },
         }) : null)

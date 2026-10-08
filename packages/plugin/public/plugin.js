@@ -3,7 +3,9 @@
 
 const $ = (id) => document.getElementById(id)
 const API = '/remote/admin/api'
+const t = (key, vars) => (window.I18N ? window.I18N.t(key, vars) : key)
 let latest = null
+let lastDays = []
 let busy = false
 let usageBusy = false
 let usageLoadedAt = 0
@@ -28,6 +30,7 @@ function renderUsage(days) {
   const section = $('plugin-usage')
   const empty = $('plugin-usage-empty')
   if (!section) return
+  if (Array.isArray(days) && days.length) lastDays = days
   if (!Array.isArray(days) || !days.length) {
     section.classList.add('empty')
     empty?.classList.remove('hidden')
@@ -35,7 +38,7 @@ function renderUsage(days) {
     text('plugin-token-total', '—')
     text('plugin-peak-share', '0%')
     text('plugin-cost', '—')
-    text('plugin-cost-split', '等待网关统计')
+    text('plugin-cost-split', t('costWaiting'))
     if ($('plugin-token-track')) $('plugin-token-track').innerHTML = ''
     $('plugin-usage-ring')?.style.setProperty('--plugin-peak', '0%')
     return
@@ -57,7 +60,7 @@ function renderUsage(days) {
   text('plugin-token-total', fmtTokens(totalTokens))
   text('plugin-peak-share', peakShare + '%')
   text('plugin-cost', fmtCost(totalCost))
-  text('plugin-cost-split', `高峰 ${fmtCost(peakCost)} · 空闲 ${fmtCost(offCost)}`)
+  text('plugin-cost-split', t('costSplit', { peak: fmtCost(peakCost), off: fmtCost(offCost) }))
   const track = $('plugin-token-track')
   if (track) track.innerHTML = `<i class="input" style="width:${share(input)}%"></i><i class="cache" style="width:${share(cache)}%"></i><i class="output" style="width:${share(output)}%"></i>`
   $('plugin-usage-ring')?.style.setProperty('--plugin-peak', peakShare + '%')
@@ -95,21 +98,21 @@ function render(st) {
   hero.classList.toggle('warn', gateway && !healthy)
   hero.classList.toggle('off', !gateway)
 
-  text('plugin-status', healthy ? '系统运行正常' : gateway ? '网关需要关注' : installed ? '网关待启动' : 'DSH 已连接')
+  text('plugin-status', healthy ? t('statusOk') : gateway ? t('statusWarn') : installed ? t('statusStopped') : t('statusEmbedded'))
   text('plugin-status-desc', healthy
-    ? `${st.onlineCount || 0} 台设备在线 · 最近请求 ${st.totalRequests || 0} 次`
-    : authError || (gateway ? 'DSH 上游暂时不可达，请打开控制台诊断' : installed ? '本地网关尚未运行，启动后即可远程连接' : '插件已连接 DSH，但未检测到网关程序'))
-  text('plugin-status-meta', healthy ? '本地服务可用' : gateway ? '需要查看诊断' : installed ? '本地服务未启动' : '仅 DSH 内嵌模式')
+    ? t('descOk', { devices: st.onlineCount || 0, reqs: st.totalRequests || 0 })
+    : authError || (gateway ? t('descWarn') : installed ? t('descStopped') : t('descEmbedded')))
+  text('plugin-status-meta', healthy ? t('metaOk') : gateway ? t('metaWarn') : installed ? t('metaStopped') : t('metaEmbedded'))
 
   const primary = $('plugin-primary')
-  primary.textContent = gateway ? '打开控制台' : installed ? '启动网关' : '查看控制台'
+  primary.textContent = gateway ? t('primaryConsole') : installed ? t('primaryStart') : t('primaryView')
   primary.dataset.action = gateway ? 'console' : installed ? 'start' : 'console'
-  text('plugin-toggle-label', gateway ? '停止网关' : '启动网关')
+  text('plugin-toggle-label', gateway ? t('toggleStop') : t('toggleStart'))
   $('plugin-toggle-icon')?.setAttribute('data-morph-state', gateway ? 'open' : 'closed')
   $('plugin-toggle').classList.toggle('hidden', !installed)
 
   text('plugin-version', st.version ? 'v' + st.version : '—')
-  text('plugin-gateway-version', gateway ? ('v' + (st.gatewayVersion || st.version || '未知')) : '未运行')
+  text('plugin-gateway-version', gateway ? ('v' + (st.gatewayVersion || st.version || t('unknown'))) : t('notRunning'))
   text('plugin-devices', `${st.onlineCount || 0} / ${st.deviceCount || 0}`)
   text('plugin-host', (st.lanIPs || []).find(x => x && x !== '127.0.0.1') || st.host || '127.0.0.1')
   if (!gateway) {
@@ -136,10 +139,10 @@ async function readState() {
   } catch (e) {
     $('plugin-hero').classList.remove('ok', 'warn')
     $('plugin-hero').classList.add('off')
-    text('plugin-status', '无法读取状态')
-    text('plugin-status-desc', 'DSH Remote 插件暂时无法访问本地服务')
-    text('plugin-status-meta', '请稍后重试')
-    $('plugin-error').textContent = '状态读取失败：' + escapeText(e.message || e)
+    text('plugin-status', t('statusUnreachable'))
+    text('plugin-status-desc', t('descUnreachable'))
+    text('plugin-status-meta', t('metaRetry'))
+    $('plugin-error').textContent = t('errStateLoad', { error: e.message || e })
     $('plugin-error').classList.remove('hidden')
   }
 }
@@ -156,11 +159,11 @@ async function toggleGateway() {
     })
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const out = await res.json()
-    if (!out.ok) throw new Error(out.error || '网关操作未完成')
+    if (!out.ok) throw new Error(out.error || t('errGatewayIncomplete'))
     await new Promise(resolve => setTimeout(resolve, 650))
     await load()
   } catch (e) {
-    $('plugin-error').textContent = '网关操作失败：' + (e.message || e)
+    $('plugin-error').textContent = t('errGatewayOp', { error: e.message || e })
     $('plugin-error').classList.remove('hidden')
   } finally { setBusy(false) }
 }
@@ -168,16 +171,20 @@ async function toggleGateway() {
 async function copyToken() {
   const token = latest?.token || ''
   if (!token) return
+  const label = $('plugin-copy-label') || $('plugin-copy')?.lastChild
   try {
     await navigator.clipboard.writeText(token)
-    const button = $('plugin-copy')
-    const old = button.lastChild
-    if (old) old.textContent = '已复制'
-    setTimeout(() => { if (old) old.textContent = '复制令牌' }, 1400)
+    if (label) label.textContent = t('copied')
+    setTimeout(() => { if (label) label.textContent = t('copyToken') }, 1400)
   } catch {
-    $('plugin-error').textContent = '复制失败，请从控制台手动复制'
+    $('plugin-error').textContent = t('errCopy')
     $('plugin-error').classList.remove('hidden')
   }
+}
+
+function renderLangBtn() {
+  const btn = $('plugin-lang')
+  if (btn) btn.textContent = (window.I18N && window.I18N.lang === 'en') ? '中文' : 'EN'
 }
 
 $('plugin-close').addEventListener('click', closePanel)
@@ -189,7 +196,17 @@ $('plugin-primary').addEventListener('click', () => {
   if ($('plugin-primary').dataset.action === 'start') toggleGateway()
   else openConsole()
 })
+$('plugin-lang')?.addEventListener('click', () => {
+  if (!window.I18N) return
+  window.I18N.setLang(window.I18N.lang === 'zh' ? 'en' : 'zh')
+  renderLangBtn()
+  if (latest) render(latest)
+  else load()
+  renderUsage(lastDays)
+})
 
+if (window.I18N) window.I18N.init(window.PLUGIN_STR)
+renderLangBtn()
 load()
 loadUsage()
 setInterval(load, 5000)

@@ -14,6 +14,8 @@
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="genui.css">
   <link rel="stylesheet" href="plugin-center.css">
+  <link rel="stylesheet" href="skills.css">
+  <link rel="stylesheet" href="extensions.css">
   <link rel="stylesheet" href="insights.css">
 </head>
 <body>
@@ -749,7 +751,7 @@
     <div class="session-dialog-head"><strong id="session-actions-title" data-i18n="session.more">更多操作</strong><button type="button" data-session-dialog-close aria-label="关闭">×</button></div>
         <button id="btn-rename-session" class="icon-btn hidden" data-i18n-title="session.rename" data-i18n-aria="session.rename" data-i18n="session.rename">重命名会话</button>
         <button id="btn-stats" class="icon-btn" data-i18n-title="stats.title" data-i18n-aria="stats.title" data-i18n="stats.title">本轮统计</button>
-        <button id="btn-insights" class="icon-btn" data-i18n-title="insights.title" data-i18n-aria="insights.title" data-i18n="insights.title">上下文与费用</button>
+        <button id="btn-insights" class="icon-btn hidden" data-i18n-title="insights.title" data-i18n-aria="insights.title" data-i18n="insights.title">上下文与费用</button>
 
     <button id="btn-session-info" type="button" data-i18n="session.details">会话详情</button>
         <button id="btn-archive-session" class="mini-btn hidden" data-i18n="session.archive">归档</button>
@@ -983,7 +985,7 @@
         'session.stop': '停止本轮', 'session.history': '对话', 'session.errorMsg': '会话出错：{msg}', 'session.recovering': '恢复会话中…', 'session.recoveryReady': '会话已恢复', 'session.recoveryFailed': '会话恢复失败', 'session.recoveryCached': '正在查看缓存历史',
         'session.confirmStop': '停止当前回合？排队中的消息不会被删除。', 'session.stopFailed': '停止失败', 'session.stopRequested': '已请求停止本轮', 'session.archive': '归档', 'session.archiveConfirm': '归档这个会话？归档后可在“显示已归档会话”中打开。', 'session.archiveFailed': '归档失败：{msg}', 'session.archived': '会话已归档', 'session.archiveTitle': '确认归档会话', 'session.archiveDesc': '归档后会话将从普通列表隐藏，但不会删除对话记录。', 'session.archiveConversation': '对话', 'session.archiveWorkspace': '工作区', 'session.archiveCancel': '取消', 'session.archiveConfirmAction': '确认归档', 'session.rename': '重命名会话', 'session.renameTitle': '重命名会话', 'session.renamePlaceholder': '输入新的会话名称', 'session.renameCancel': '取消', 'session.renameConfirm': '保存', 'session.renameEmpty': '会话名称不能为空', 'session.renameFailed': '重命名失败', 'session.renamed': '会话名称已更新',
         'notify.approvalTitle': '工具审批', 'notify.approvalBody': '{tool} 需要批准', 'notify.questionTitle': 'DSH 提问', 'notify.questionBody': '需要你回答',
-        'notify.permissionFailed': '通知权限申请失败：{msg}',
+        'notify.permissionFailed': '通知权限申请失败：{msg}', 'notify.hostUnavailable': '此通知所属服务器已移除或令牌已变更，请重新连接后查看待处理事项',
         'history.cached': '本地缓存', 'history.syncing': '本地缓存 · 正在同步', 'history.synced': '最新记录已同步', 'history.saved': '最新记录 · 已缓存', 'history.offline': '本地记录 · 网络不可用', 'history.earlier': '加载更早的记录', 'history.loadingEarlier': '正在加载更早的记录…', 'history.latest': '回到最新', 'history.cacheFailed': '已同步 · 本地缓存未保存', 'history.loading': '加载历史…', 'history.cacheFallback': '网络不可用：显示本地缓存的历史', 'history.loadFailed': '加载历史失败：{msg}', 'history.retry': '重试',
         'history.offlineCache': '离线缓存 {n} 条', 'history.count': '{n} 条', 'history.empty': '还没有消息',
         'history.queueAndCount': '队列 {q} · 历史 {n}', 'history.countOnly': '历史 {n}',
@@ -994,6 +996,8 @@
         'block.image': '图片', 'block.thinking': '🧠 思考过程', 'block.thinkingLive': '🧠 思考中…', 'block.toolCall': '工具调用', 'block.toolResult': '工具结果', 'block.unknown': '块 · {type}',
         'truncated': '…(截断)',
         'insights.title': '上下文与费用',
+        'insights.contextTitle': '上下文分析',
+        'insights.costTitle': '费用与额度',
         'stats.title': '本轮统计', 'stats.roundTitle': '本轮统计', 'stats.turnsSteps': '轮次 / 步骤',
         'stats.llmTime': '模型耗时', 'stats.minutes': ' 分钟', 'stats.outputCache': '输出 / 缓存读',
         'stats.ctxPressure': '上下文压力', 'stats.permission': '权限', 'stats.empty': '暂无统计数据',
@@ -1222,7 +1226,7 @@
         'session.stop': 'Stop turn', 'session.history': 'Conversation', 'session.errorMsg': 'Session error: {msg}', 'session.recovering': 'Restoring session…', 'session.recoveryReady': 'Session ready', 'session.recoveryFailed': 'Session restore failed', 'session.recoveryCached': 'Viewing cached history',
         'session.confirmStop': 'Stop the current turn? Queued messages will be kept.', 'session.stopFailed': 'Stop failed', 'session.stopRequested': 'Stop requested', 'session.archive': 'Archive', 'session.archiveConfirm': 'Archive this session? You can open it from “Show archived”.', 'session.archiveFailed': 'Archive failed: {msg}', 'session.archived': 'Session archived', 'session.archiveTitle': 'Confirm archive', 'session.archiveDesc': 'The session will be hidden from the normal list, but its conversation will not be deleted.', 'session.archiveConversation': 'Conversation', 'session.archiveWorkspace': 'Workspace', 'session.archiveCancel': 'Cancel', 'session.archiveConfirmAction': 'Archive session', 'session.rename': 'Rename session', 'session.renameTitle': 'Rename session', 'session.renamePlaceholder': 'Enter a new session name', 'session.renameCancel': 'Cancel', 'session.renameConfirm': 'Save', 'session.renameEmpty': 'Session name cannot be empty', 'session.renameFailed': 'Rename failed', 'session.renamed': 'Session name updated',
         'notify.approvalTitle': 'Tool approval', 'notify.approvalBody': '{tool} needs approval', 'notify.questionTitle': 'DSH question', 'notify.questionBody': 'Needs your answer',
-        'notify.permissionFailed': 'Notification permission failed: {msg}',
+        'notify.permissionFailed': 'Notification permission failed: {msg}', 'notify.hostUnavailable': 'This notification belongs to a removed server or changed credential. Reconnect to view pending requests.',
         'history.cached': 'Local cache', 'history.syncing': 'Local cache · Syncing', 'history.synced': 'Latest history synced', 'history.saved': 'Latest history · Cached', 'history.offline': 'Local history · Offline', 'history.earlier': 'Load earlier history', 'history.loadingEarlier': 'Loading earlier history…', 'history.latest': 'Jump to latest', 'history.cacheFailed': 'Synced · Cache could not be saved', 'history.loading': 'Loading history…', 'history.cacheFallback': 'Network unavailable: showing cached history', 'history.loadFailed': 'Failed to load history: {msg}', 'history.retry': 'Retry',
         'history.offlineCache': 'Offline cache {n} items', 'history.count': '{n} items', 'history.empty': 'No messages yet',
         'history.queueAndCount': 'Queue {q} · History {n}', 'history.countOnly': 'History {n}',
@@ -1233,6 +1237,8 @@
         'block.image': 'Image', 'block.thinking': '🧠 Thinking', 'block.thinkingLive': '🧠 Thinking…', 'block.toolCall': 'Tool call', 'block.toolResult': 'Tool result', 'block.unknown': 'Block · {type}',
         'truncated': '…(truncated)',
         'insights.title': 'Context & costs',
+        'insights.contextTitle': 'Context analysis',
+        'insights.costTitle': 'Cost & quotas',
         'stats.title': 'This round', 'stats.roundTitle': 'This round', 'stats.turnsSteps': 'Turns / steps',
         'stats.llmTime': 'LLM time', 'stats.minutes': ' min', 'stats.outputCache': 'Output / cache read',
         'stats.ctxPressure': 'Context pressure', 'stats.permission': 'Permission', 'stats.empty': 'No stats yet',
@@ -1397,12 +1403,15 @@
   <script src="i18n.js"></script>
   <script src="theme.js"></script>
   <script src="genui.js"></script>
+  <script src="chat-files.js"></script>
   <script src="md.js"></script>
   <script src="vendor/gsap/gsap.min.js"></script>
   <script src="motion.js"></script>
   <script type="module" src="morphicons-init.js"></script>
   <script src="plugin-center.js"></script>
+  <script src="skills.js"></script>
   <script src="insights.js"></script>
+  <script src="extensions.js"></script>
   <script src="history.js"></script>
   <script src="link-check.js"></script>
   <script src="network.js"></script>

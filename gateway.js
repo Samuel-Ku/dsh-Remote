@@ -39,6 +39,509 @@ const crypto = require('node:crypto')
 const zlib = require('node:zlib')
 const { pipeline } = require('node:stream')
 
+// BEGIN GENERATED RELAY HOST
+const embeddedRelayHost = (() => {
+const factories = {
+"./registry.cjs": function(require, module, exports) {
+'use strict'
+// Operator-owned relay state. This is separate from every user's Remote profile.
+const fs = require('node:fs')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const net = require('node:net')
+
+function fault(code, status = 400) { return Object.assign(new Error(code), { code, status }) }
+function hostname(value) {
+  const name = String(value || '').toLowerCase()
+  if (name.length > 253 || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(name)) throw fault('INVALID_HOST')
+  return name
+}
+function publicKey(value) {
+  if (typeof value !== 'string' || value.length > 1024) throw fault('INVALID_PUBLIC_KEY')
+  let key
+  try { key = crypto.createPublicKey(value) } catch { throw fault('INVALID_PUBLIC_KEY') }
+  if (key.asymmetricKeyType !== 'ed25519') throw fault('INVALID_PUBLIC_KEY')
+  return key.export({ format: 'pem', type: 'spki' }).toString()
+}
+const digest = value => crypto.createHash('sha256').update(value).digest('hex')
+const live = (grant, now = Date.now()) => grant && !grant.revokedAt && grant.expiresAt > now
+const signingText = (nonce, id, role, session = '') => Buffer.from(JSON.stringify(['dsh-relay-v1', nonce, id, role, session]))
+
+class Registry {
+  constructor(file) { this.file = path.resolve(file) }
+  read() {
+    const state = JSON.parse(fs.readFileSync(this.file, 'utf8'))
+    if (state.version !== 1 || !Array.isArray(state.grants)) throw fault('INVALID_REGISTRY', 503)
+    return state
+  }
+  change(fn) {
+    const lock = this.file + '.lock'
+    let fd
+    try { fd = fs.openSync(lock, 'wx', 0o600) } catch { throw fault('REGISTRY_BUSY', 503) }
+    try {
+      const state = this.read()
+      const result = fn(state)
+      const temp = this.file + '.' + crypto.randomBytes(8).toString('hex') + '.tmp'
+      try {
+        fs.writeFileSync(temp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600, flag: 'wx' })
+        fs.renameSync(temp, this.file)
+      } finally { try { fs.unlinkSync(temp) } catch {} }
+      return result
+    } finally { fs.closeSync(fd); fs.unlinkSync(lock) }
+  }
+  static init(file, config) {
+    const origin = new URL(config.origin)
+    if (origin.protocol !== 'https:' || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) throw fault('HTTPS_ORIGIN_REQUIRED')
+    const baseDomain = hostname(config.baseDomain)
+    const tunnelValue = config.tunnelHost || origin.hostname
+    const tunnelHost = net.isIP(tunnelValue) ? tunnelValue : hostname(tunnelValue)
+    const tunnelPort = Number(config.tunnelPort || origin.port || 443)
+    if (!Number.isInteger(tunnelPort) || tunnelPort < 1 || tunnelPort > 65535) throw fault('INVALID_PORT')
+    fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(file, JSON.stringify({ version: 1, origin: origin.origin, baseDomain, tunnelHost, tunnelPort, maxUsers: 5, grants: [] }, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
+    return new Registry(file)
+  }
+  issue({ label = '', domain, expiresAt }) {
+    const expires = Number(expiresAt)
+    if (!Number.isFinite(expires) || expires <= Date.now() || expires > Date.now() + 90 * 86400000) throw fault('INVALID_EXPIRY')
+    return this.change(state => {
+      if (state.grants.filter(g => live(g)).length >= state.maxUsers) throw fault('PILOT_FULL', 409)
+      const id = crypto.randomBytes(8).toString('hex')
+      const assigned = hostname(domain || `r-${id}.${state.baseDomain}`)
+      if (!assigned.endsWith('.' + state.baseDomain) || assigned === new URL(state.origin).hostname || assigned === state.tunnelHost) throw fault('INVALID_TENANT_DOMAIN')
+      if (state.grants.some(g => g.domain === assigned)) throw fault('DOMAIN_ALREADY_ASSIGNED', 409)
+      const code = `dsrp_${id}.${crypto.randomBytes(32).toString('base64url')}`
+      const grant = { id, label: String(label).slice(0, 80), domain: assigned, expiresAt: expires, createdAt: Date.now(), codeHash: digest(code), publicKey: null, revokedAt: null }
+      state.grants.push(grant)
+      return { code, grant: this.view(grant) }
+    })
+  }
+  view(g) { return { id: g.id, label: g.label, domain: g.domain, expiresAt: g.expiresAt, state: g.revokedAt ? 'revoked' : !live(g) ? 'expired' : g.publicKey ? 'bound' : 'invited', fingerprint: g.publicKey ? digest(g.publicKey) : null } }
+  list() { return this.read().grants.map(g => this.view(g)) }
+  revoke(id) {
+    return this.change(state => {
+      const grant = state.grants.find(g => g.id === id)
+      if (!grant) throw fault('NOT_FOUND', 404)
+      grant.revokedAt ||= Date.now()
+      return this.view(grant)
+    })
+  }
+  enroll(code, key) {
+    const match = /^dsrp_([a-f0-9]{16})\.[A-Za-z0-9_-]{43}$/.exec(String(code || ''))
+    if (!match) throw fault('INVALID_AUTHORIZATION', 403)
+    const normalized = publicKey(key)
+    return this.change(state => {
+      const grant = state.grants.find(g => g.id === match[1])
+      if (!live(grant) || !crypto.timingSafeEqual(Buffer.from(grant.codeHash, 'hex'), Buffer.from(digest(code), 'hex'))) throw fault('INVALID_AUTHORIZATION', 403)
+      if (grant.publicKey && grant.publicKey !== normalized) throw fault('HOST_ALREADY_BOUND', 409)
+      grant.publicKey = normalized
+      return { grantId: grant.id, domain: grant.domain, expiresAt: grant.expiresAt, publicUrl: `https://${grant.domain}`, dailyLimitBytes: 5_000_000_000, timezone: 'Asia/Shanghai', transport: 'https-upgrade', tunnelOrigin: state.origin, tunnelHost: state.tunnelHost, tunnelPort: state.tunnelPort }
+    })
+  }
+  get(id) { return this.read().grants.find(g => g.id === id) }
+}
+
+module.exports = { Registry, fault, hostname, publicKey, digest, live, signingText }
+},
+"./wire.cjs": function(require, module, exports) {
+'use strict'
+const { fault } = require('./registry.cjs')
+
+// One bounded JSON line for each state transition, then unmodified TCP bytes.
+// Pausing and unshifting the tail preserves coalesced handshake + HTTP packets.
+function line(socket, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    let buffered = Buffer.alloc(0)
+    const timer = setTimeout(() => finish(fault('HANDSHAKE_TIMEOUT', 408)), timeout)
+    const clean = () => { clearTimeout(timer); socket.off('data', data); socket.off('error', error); socket.off('close', closed) }
+    const finish = (err, result) => { clean(); err ? reject(err) : resolve(result) }
+    const error = () => finish(fault('CHANNEL_ERROR', 503))
+    const closed = () => finish(fault('CHANNEL_CLOSED', 503))
+    const data = chunk => {
+      buffered = Buffer.concat([buffered, chunk])
+      const end = buffered.indexOf(10)
+      if (end < 0 && buffered.length <= 8192) return
+      if (end < 0 || end > 8192) return finish(fault('HANDSHAKE_TOO_LARGE', 413))
+      socket.pause()
+      const tail = buffered.subarray(end + 1)
+      if (tail.length) socket.unshift(tail)
+      try { finish(null, JSON.parse(buffered.subarray(0, end).toString('utf8'))) } catch { finish(fault('INVALID_HANDSHAKE')) }
+    }
+    socket.on('data', data); socket.once('error', error); socket.once('close', closed)
+    socket.resume()
+  })
+}
+function send(socket, value) { if (!socket.destroyed) socket.write(JSON.stringify(value) + '\n') }
+function link(left, right) {
+  left.on('error', () => right.destroy()); right.on('error', () => left.destroy())
+  left.once('close', () => right.destroy()); right.once('close', () => left.destroy())
+  left.pipe(right); right.pipe(left)
+  left.resume(); right.resume()
+}
+module.exports = { line, send, link }
+},
+"./options.cjs": function(require, module, exports) {
+'use strict'
+module.exports = function options(args) {
+  const result = { _: [] }
+  for (let i = 0; i < args.length; i++) {
+    if (!args[i].startsWith('--')) result._.push(args[i])
+    else {
+      const key = args[i].slice(2)
+      if (!key || i + 1 >= args.length || args[i + 1].startsWith('--') || Object.hasOwn(result, key)) throw new Error('Invalid CLI option')
+      result[key] = args[++i]
+    }
+  }
+  return result
+}
+},
+"./client.cjs": function(require, module, exports) {
+'use strict'
+const fs = require('node:fs')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const https = require('node:https')
+const tls = require('node:tls')
+const net = require('node:net')
+const { EventEmitter } = require('node:events')
+const { line, send, link } = require('./wire.cjs')
+const { signingText, fault } = require('./registry.cjs')
+
+function gatewayAddress(value) {
+  const url = new URL(value)
+  if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw fault('LOCAL_GATEWAY_REQUIRED')
+  return { host: url.hostname.replace(/^\[|\]$/g, ''), port: Number(url.port || 80) }
+}
+function enroll(origin, code, publicKey, ca) {
+  const url = new URL('/relay/v1/enroll', origin)
+  if (new URL(origin).origin !== String(origin).replace(/\/$/, '') || url.protocol !== 'https:' || url.username || url.password) return Promise.reject(fault('HTTPS_ORIGIN_REQUIRED'))
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify({ code, publicKey }))
+    const request = https.request(url, { method: 'POST', ca, headers: { 'content-type': 'application/json', 'content-length': data.length }, timeout: 12000 }, response => {
+      const chunks = []; let bytes = 0
+      response.on('data', chunk => { bytes += chunk.length; if (bytes > 8192) request.destroy(); else chunks.push(chunk) })
+      response.on('end', () => {
+        if (response.statusCode !== 200) {
+          let code = 'ENROLLMENT_REJECTED'
+          try {
+            const candidate = JSON.parse(Buffer.concat(chunks).toString('utf8')).error
+            if (['INVALID_AUTHORIZATION', 'HOST_ALREADY_BOUND', 'REGISTRY_BUSY', 'TRY_LATER', 'INVALID_PUBLIC_KEY', 'INVALID_ENROLLMENT'].includes(candidate)) code = candidate
+          } catch {}
+          return reject(fault(code, response.statusCode))
+        }
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) } catch { reject(fault('INVALID_SERVER_RESPONSE')) }
+      })
+    })
+    request.on('timeout', () => request.destroy())
+    request.on('error', () => reject(fault('ENROLLMENT_CONNECTION_FAILED', 503)))
+    request.end(data)
+  })
+}
+
+function upgradeChannel(origin, ca) {
+  const target = new URL(origin)
+  if (target.protocol !== 'https:' || target.username || target.password || target.pathname !== '/' || target.search || target.hash) return Promise.reject(fault('HTTPS_ORIGIN_REQUIRED'))
+  return new Promise((resolve, reject) => {
+    const request = https.request(new URL('/relay/v1/tunnel', target), { ca, headers: { connection: 'Upgrade', upgrade: 'dsh-relay-v1' }, timeout: 12000 })
+    request.on('upgrade', (response, socket, head) => {
+      request.setTimeout(0)
+      if (String(response.headers.upgrade).toLowerCase() !== 'dsh-relay-v1') { socket.destroy(); return reject(fault('INVALID_TUNNEL_UPGRADE')) }
+      socket.pause()
+      if (head.length) socket.unshift(head)
+      resolve(socket)
+    })
+    request.on('response', response => { response.resume(); reject(fault('TUNNEL_UPGRADE_REJECTED', response.statusCode)) })
+    request.on('timeout', () => request.destroy())
+    request.on('error', () => reject(fault('TUNNEL_CONNECTION_FAILED', 503)))
+    request.end()
+  })
+}
+
+class RelayClient extends EventEmitter {
+  constructor({ grantId, privateKey, tunnelHost, tunnelPort, tunnelOrigin, expiresAt, gateway = 'http://127.0.0.1:8787', ca, poolSize = 4, reconnectMs = 1500 }) {
+    super()
+    if (!/^[a-f0-9]{16}$/.test(grantId || '') || !Number.isInteger(Number(tunnelPort)) || tunnelPort < 1 || tunnelPort > 65535 || !Number.isFinite(expiresAt)) throw fault('INVALID_CLIENT_CONFIG')
+    this.grantId = grantId; this.privateKey = crypto.createPrivateKey(privateKey)
+    if (this.privateKey.asymmetricKeyType !== 'ed25519') throw fault('INVALID_PRIVATE_KEY')
+    this.target = gatewayAddress(gateway)
+    this.tunnelHost = tunnelHost; this.tunnelPort = Number(tunnelPort); this.expiresAt = expiresAt; this.ca = ca
+    this.tunnelOrigin = tunnelOrigin
+    this.poolSize = Math.min(6, Math.max(1, poolSize)); this.reconnectMs = reconnectMs
+    this.context = null; this.running = false; this.timer = null; this.failures = 0; this.controlSocket = null; this.epoch = 0
+  }
+  async authenticate(role, session = '', context) {
+    const socket = this.tunnelOrigin ? await upgradeChannel(this.tunnelOrigin, this.ca) : tls.connect({ host: this.tunnelHost, port: this.tunnelPort, servername: net.isIP(this.tunnelHost) ? undefined : this.tunnelHost, ca: this.ca, minVersion: 'TLSv1.2', rejectUnauthorized: true })
+    socket.on('error', () => {}); socket.setNoDelay(true); socket.setKeepAlive(true, 30000)
+    if (context) { context.sockets.add(socket); socket.once('close', () => context.sockets.delete(socket)) }
+    else this.controlSocket = socket
+    try {
+      const challenge = await line(socket)
+      if (challenge.type !== 'challenge' || !/^[A-Za-z0-9_-]{43}$/.test(challenge.nonce || '')) throw fault('INVALID_CHALLENGE')
+      const signature = crypto.sign(null, signingText(challenge.nonce, this.grantId, role, session), this.privateKey).toString('base64url')
+      send(socket, { grantId: this.grantId, role, session, signature })
+      const accepted = await line(socket)
+      if (accepted.type === 'rejected' && accepted.code === 'AUTHORIZATION_INACTIVE') throw fault('AUTHORIZATION_INACTIVE', 403)
+      if (!this.running || Date.now() >= this.expiresAt || accepted.type !== (role === 'control' ? 'accepted' : 'parked')) throw fault('CONNECTION_NOT_ACCEPTED')
+      return { socket, accepted }
+    } catch (error) { socket.destroy(); throw error }
+  }
+  start() { if (!this.running) { this.running = true; this.epoch++; this.connect() }; return this }
+  async connect() {
+    if (!this.running) return
+    if (Date.now() >= this.expiresAt) { this.stop(); this.emit('status', 'expired'); return }
+    let context
+    const epoch = this.epoch
+    try {
+      const { socket, accepted } = await this.authenticate('control')
+      if (epoch !== this.epoch) { socket.destroy(); return }
+      context = { socket, session: accepted.session, sockets: new Set([socket]), pending: 0, closing: false, retryTimer: null }
+      this.context = context; this.failures = 0
+      if (accepted.usage) this.emit('usage', accepted.usage)
+      this.emit('status', 'online'); this.refill(context)
+      while (this.running && !context.closing) {
+        const message = await line(socket, 65000)
+        if (message.type === 'usage') { this.emit('usage', message.usage); continue }
+        if (message.type !== 'ping') throw fault('INVALID_CONTROL_MESSAGE')
+        if (message.usage) this.emit('usage', message.usage)
+        send(socket, { type: 'pong' })
+      }
+    } catch (error) {
+      if (error.code === 'AUTHORIZATION_INACTIVE') { this.stop(); this.emit('status', 'authorization-inactive') }
+      else if (this.running) this.emit('status', 'reconnecting')
+    }
+    finally {
+      if (context) this.dispose(context)
+      if (context && this.controlSocket === context.socket) this.controlSocket = null
+      if (this.running && epoch === this.epoch) {
+        const wait = Math.min(60000, this.reconnectMs * 2 ** Math.min(this.failures++, 6))
+        this.timer = setTimeout(() => this.connect(), wait)
+      }
+    }
+  }
+  refill(context) {
+    if (!this.running || context.closing || this.context !== context || Date.now() >= this.expiresAt) return
+    while (context.pending < this.poolSize) { context.pending++; this.work(context) }
+  }
+  async work(context) {
+    let pending = true, remote, local, failed = false
+    try {
+      const accepted = await this.authenticate('work', context.session, context)
+      remote = accepted.socket
+      const start = await line(remote, 60000)
+      if (start.type !== 'start' || context.closing || this.context !== context) throw fault('STALE_WORK')
+      context.pending--; pending = false
+      this.refill(context)
+      local = net.connect(this.target); context.sockets.add(local)
+      local.setNoDelay(true)
+      const connectTimer = setTimeout(() => local.destroy(), 5000)
+      local.once('connect', () => clearTimeout(connectTimer))
+      local.once('close', () => clearTimeout(connectTimer))
+      // A work channel is single-use. Failed writes are never replayed.
+      link(remote, local)
+      await new Promise(resolve => remote.once('close', resolve))
+    } catch (error) {
+      failed = true
+      if (error.code === 'AUTHORIZATION_INACTIVE') { this.stop(); this.emit('status', 'authorization-inactive') }
+    }
+    finally {
+      remote?.destroy(); local?.destroy()
+      if (remote) context.sockets.delete(remote)
+      if (local) context.sockets.delete(local)
+      if (pending) context.pending--
+      if (!context.closing && this.running && this.context === context) {
+        // Retry failed pool connections at most once per second, not in a hot loop.
+        if (failed) {
+          if (!context.retryTimer) context.retryTimer = setTimeout(() => { context.retryTimer = null; this.refill(context) }, 1000)
+        } else this.refill(context)
+      }
+    }
+  }
+  dispose(context) {
+    context.closing = true; clearTimeout(context.retryTimer)
+    for (const socket of context.sockets) socket.destroy()
+    context.sockets.clear()
+    if (this.context === context) this.context = null
+  }
+  stop() {
+    this.running = false; this.epoch++; clearTimeout(this.timer); this.controlSocket?.destroy()
+    if (this.context) this.dispose(this.context)
+  }
+}
+
+async function main() {
+  const args = require('./options.cjs')(process.argv.slice(2))
+  if (!args.state) throw fault('STATE_DIRECTORY_REQUIRED')
+  const root = path.resolve(args.state)
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  const ca = args.ca ? fs.readFileSync(args.ca) : undefined
+  const configFile = path.join(root, 'connection.json')
+  const keyFile = path.join(root, 'host-private.pem')
+  const stopFile = path.join(root, 'stop.request')
+  if (args._[0] === 'enroll') {
+    const invite = JSON.parse(fs.readFileSync(args.invite, 'utf8'))
+    const gateway = args.gateway || 'http://127.0.0.1:8787'
+    gatewayAddress(gateway)
+    if (!fs.existsSync(keyFile)) {
+      const keys = crypto.generateKeyPairSync('ed25519')
+      fs.writeFileSync(keyFile, keys.privateKey.export({ format: 'pem', type: 'pkcs8' }), { flag: 'wx', mode: 0o600 })
+    }
+    const key = crypto.createPrivateKey(fs.readFileSync(keyFile))
+    const pub = crypto.createPublicKey(key).export({ format: 'pem', type: 'spki' }).toString()
+    const config = await enroll(invite.server, invite.code, pub, ca)
+    fs.writeFileSync(configFile, JSON.stringify({ ...config, gateway }, null, 2) + '\n', { mode: 0o600 })
+    console.log(JSON.stringify({ publicUrl: config.publicUrl, expiresAt: config.expiresAt }))
+  } else if (args._[0] === 'run') {
+    if (fs.existsSync(stopFile)) fs.unlinkSync(stopFile)
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'))
+    const client = new RelayClient({ ...config, privateKey: fs.readFileSync(keyFile), ca })
+    let stopTimer
+    const stop = () => { clearInterval(stopTimer); client.stop(); setTimeout(() => process.exit(0), 100) }
+    client.on('status', status => { console.log(JSON.stringify({ status })); if (['expired', 'authorization-inactive'].includes(status)) stop() })
+    stopTimer = setInterval(() => { if (fs.existsSync(stopFile)) stop() }, 500)
+    process.once('SIGTERM', stop); process.once('SIGINT', stop)
+    client.start()
+  } else if (args._[0] === 'stop') {
+    fs.writeFileSync(stopFile, 'stop\n', { mode: 0o600 })
+    console.log('Relay stop requested.')
+  } else throw fault('USE_ENROLL_RUN_OR_STOP')
+}
+if (require.main === module) main().catch(error => { console.error(error.code || 'CLIENT_FAILED'); process.exitCode = 1 })
+module.exports = { RelayClient, enroll, gatewayAddress }
+},
+"./host.cjs": function(require, module, exports) {
+'use strict'
+const fs = require('node:fs')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const { RelayClient, enroll } = require('./client.cjs')
+const { fault } = require('./registry.cjs')
+const DEFAULT_ORIGIN = 'https://relay-pilot.blankalwaysgoeson.site'
+
+// Runs inside the gateway process: no launcher, scheduled task or runtime install.
+class RelayHost {
+  constructor({ root, gateway, origin = DEFAULT_ORIGIN, ca }) {
+    this.root = root; this.gateway = gateway; this.origin = origin; this.ca = ca
+    this.file = path.join(root, 'connection.json'); this.keyFile = path.join(root, 'host-private.pem')
+    this.legacyRoot = path.join(path.dirname(root), 'owner-preview')
+    this.client = null; this.phase = 'disabled'; this.daily = null; this.updatedAt = null; this.busy = false
+    this.config = null; this.error = ''
+    if (fs.existsSync(this.file)) {
+      try { this.config = JSON.parse(fs.readFileSync(this.file, 'utf8')) }
+      catch { this.phase = 'error'; this.error = 'LOCAL_STATE_INVALID' }
+    }
+  }
+  save(config) {
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 })
+    const temp = this.file + '.' + crypto.randomBytes(8).toString('hex') + '.tmp'
+    try { fs.writeFileSync(temp, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' }); fs.renameSync(temp, this.file) }
+    finally { try { fs.unlinkSync(temp) } catch {} }
+    this.config = config
+  }
+  status() {
+    const config = this.config
+    let phase = this.phase
+    if (config && Date.now() >= config.expiresAt) phase = 'expired'
+    else if (config?.enabled && this.daily?.exhausted) phase = 'quota-exceeded'
+    else if (config?.enabled && this.daily?.unavailable) phase = 'quota-unavailable'
+    return { supported: true, enabled: !!config?.enabled, configured: !!config, phase,
+      publicUrl: config?.publicUrl || '', expiresAt: config?.expiresAt || null,
+      fingerprint: config?.fingerprint || '', daily: this.daily, usageUpdatedAt: this.updatedAt,
+      quotaPending: !!config?.enabled && !this.daily, error: this.error,
+      server: this.origin, busy: this.busy, legacyAvailable: !config && !!this.legacy() }
+  }
+  legacy() {
+    try {
+      const config = JSON.parse(fs.readFileSync(path.join(this.legacyRoot,'connection.json'),'utf8'))
+      if (config.tunnelOrigin !== this.origin || config.expiresAt <= Date.now() || !fs.existsSync(path.join(this.legacyRoot,'host-private.pem'))) return null
+      return config
+    } catch { return null }
+  }
+  startSaved() {
+    if (this.config?.enabled) {
+      try { this.start() } catch { this.phase = 'error'; this.error = 'LOCAL_STATE_INVALID' }
+    }
+  }
+  start() {
+    this.stop()
+    if (!this.config || !fs.existsSync(this.keyFile)) throw fault('HOST_NOT_CONFIGURED', 409)
+    if (this.config.expiresAt <= Date.now()) { this.phase = 'expired'; return }
+    // Only the operator-configured service is allowed, never a target supplied by a browser.
+    if (this.config.tunnelOrigin !== this.origin) throw fault('RELAY_SERVER_MISMATCH', 409)
+    const client = new RelayClient({ ...this.config, gateway: this.gateway, privateKey: fs.readFileSync(this.keyFile), ca: this.ca })
+    this.client = client; this.phase = 'connecting'; this.error = ''
+    client.on('status', status => { if (this.client === client) this.phase = status })
+    client.on('usage', daily => {
+      if (this.client !== client) return
+      this.daily = daily; this.updatedAt = Date.now()
+    })
+    client.start()
+  }
+  stop() { const client = this.client; this.client = null; client?.stop(); this.phase = 'disabled' }
+  async change(action, key) {
+    if (this.busy) throw fault('RELAY_OPERATION_BUSY', 409)
+    this.busy = true
+    try {
+      if (action === 'import') {
+        if (this.config) throw fault('HOST_ALREADY_CONFIGURED',409)
+        const config=this.legacy()
+        if (!config) throw fault('LEGACY_RELAY_UNAVAILABLE',409)
+        const privateKey=fs.readFileSync(path.join(this.legacyRoot,'host-private.pem'))
+        new RelayClient({...config,gateway:this.gateway,privateKey,ca:this.ca})
+        const publicKey=crypto.createPublicKey(crypto.createPrivateKey(privateKey)).export({format:'pem',type:'spki'}).toString()
+        fs.mkdirSync(this.root,{recursive:true,mode:0o700})
+        if (fs.existsSync(this.keyFile)) fs.copyFileSync(this.keyFile,this.keyFile+'.before-import-'+crypto.randomBytes(8).toString('hex'),fs.constants.COPYFILE_EXCL)
+        const temp=this.keyFile+'.'+crypto.randomBytes(8).toString('hex')+'.tmp'
+        try { fs.writeFileSync(temp,privateKey,{flag:'wx',mode:0o600});fs.renameSync(temp,this.keyFile) }
+        finally { try { fs.unlinkSync(temp) } catch {} }
+        this.save({...config,fingerprint:crypto.createHash('sha256').update(publicKey).digest('hex'),enabled:true})
+        // The old launcher observes this file and exits normally. Never kill a PID
+        // supplied by a browser or terminate the user's DSH/gateway processes.
+        fs.writeFileSync(path.join(this.legacyRoot,'stop.request'),'stop\n',{mode:0o600})
+        await new Promise(resolve=>setTimeout(resolve,700))
+        this.start()
+      } else if (action === 'enroll') {
+        if (!/^dsrp_[a-f0-9]{16}\.[A-Za-z0-9_-]{43}$/.test(String(key || '').trim())) throw fault('INVALID_AUTHORIZATION', 400)
+        fs.mkdirSync(this.root, { recursive: true, mode: 0o700 })
+        if (!fs.existsSync(this.keyFile)) {
+          const pair = crypto.generateKeyPairSync('ed25519')
+          fs.writeFileSync(this.keyFile, pair.privateKey.export({ format: 'pem', type: 'pkcs8' }), { flag: 'wx', mode: 0o600 })
+        }
+        const privateKey = crypto.createPrivateKey(fs.readFileSync(this.keyFile))
+        const publicKey = crypto.createPublicKey(privateKey).export({ format: 'pem', type: 'spki' }).toString()
+        const config = await enroll(this.origin, key.trim(), publicKey, this.ca)
+        // Construct before replacing a working configuration; a malformed response cannot disable it.
+        new RelayClient({ ...config, gateway: this.gateway, privateKey: privateKey.export({ format: 'pem', type: 'pkcs8' }), ca: this.ca })
+        if (config.tunnelOrigin !== this.origin || new URL(config.publicUrl).protocol !== 'https:') throw fault('INVALID_SERVER_RESPONSE', 502)
+        this.save({ ...config, fingerprint: crypto.createHash('sha256').update(publicKey).digest('hex'), enabled: true })
+        this.daily = null; this.updatedAt = null; this.start()
+      } else if (action === 'enable') {
+        if (!this.config) throw fault('HOST_NOT_CONFIGURED', 409)
+        this.save({ ...this.config, enabled: true }); this.start()
+      } else if (action === 'disable') {
+        if (this.config) this.save({ ...this.config, enabled: false })
+        // Allow the setting response to cross the tunnel before closing it.
+        const client = this.client; this.client = null; this.phase = 'disabled'
+        const timer = setTimeout(() => client?.stop(), 250); timer.unref?.()
+      } else throw fault('INVALID_RELAY_ACTION', 400)
+      return this.status()
+    } finally { this.busy = false }
+  }
+}
+module.exports = { RelayHost, DEFAULT_ORIGIN }
+}
+}
+const cache = Object.create(null)
+function load(name) {
+  if (!factories[name]) return require(name)
+  if (cache[name]) return cache[name].exports
+  const entry = cache[name] = { exports: {} }
+  factories[name](load, entry, entry.exports)
+  return entry.exports
+}
+return load('./host.cjs')
+})()
+// END GENERATED RELAY HOST
+
 // Compression is local to Remote responses, without changing DSH prototypes.
 const HTTP_COMPRESSION = process.env.GATEWAY_HTTP_COMPRESSION !== '0'
 function acceptsGzip(req) {
@@ -85,9 +588,9 @@ function compressibleRpc(req) {
 // Crash records deliberately contain facts and source positions, never arbitrary error text.
 const CRASH_LOG_FILE=process.env.DSH_REMOTE_CRASH_LOG_FILE || path.join(os.homedir(),'.dsh-remote','crashes.jsonl')
 const AUTO_RESTART=process.env.DSH_REMOTE_AUTO_RESTART!=='0'
-const CRASH_KINDS=new Set(['fatal','exit','restart','restart-failed','restart-limit','manual-stop','startup','desktop-crash'])
+const CRASH_KINDS=new Set(['fatal','exit','restart','restart-failed','restart-limit','manual-stop','startup','desktop-crash','lease-recovered','lease-conflict','lease-failed'])
 const CRASH_COMPONENTS=new Set(['gateway','dsh','desktop'])
-const CRASH_CODES=new Set(['EADDRINUSE','EACCES','EPERM','ENOENT','ENOMEM','ECONNRESET','ETIMEDOUT','ERR_OUT_OF_MEMORY','WINDOWS_APPLICATION_ERROR','PROCESS_START_FAILED','PROCESS_STOP_TIMEOUT','EXTERNAL_PROCESS','PORT_IN_USE','SERVICE_FAILED','SERVICE_TIMEOUT','EVENTS_TIMEOUT','UPSTREAM_TIMEOUT','INTERNAL_ERROR','LAUNCH_CONFIG_INVALID','STATUS_PARSE_FAILED'])
+const CRASH_CODES=new Set(['EADDRINUSE','EACCES','EPERM','ENOENT','ENOMEM','ECONNRESET','ETIMEDOUT','EINVAL','ENAMETOOLONG','ERR_OUT_OF_MEMORY','WINDOWS_APPLICATION_ERROR','PROCESS_START_FAILED','PROCESS_STOP_TIMEOUT','EXTERNAL_PROCESS','PORT_IN_USE','SERVICE_FAILED','SERVICE_TIMEOUT','EVENTS_TIMEOUT','UPSTREAM_TIMEOUT','INTERNAL_ERROR','LAUNCH_CONFIG_INVALID','STATUS_PARSE_FAILED','SUPERVISOR_ALREADY_RUNNING','SUPERVISOR_IDENTITY_UNAVAILABLE','SUPERVISOR_ENDPOINT_TOO_LONG','SUPERVISOR_LEASE_STALE','SUPERVISOR_LEASE_INVALID'])
 function safeCrashRecord(value) {
   const row={at:Number.isFinite(value?.at)?value.at:Date.now(),component:CRASH_COMPONENTS.has(value?.component)?value.component:'gateway',kind:CRASH_KINDS.has(value?.kind)?value.kind:'fatal'}
   if(Number.isInteger(value?.exitCode))row.exitCode=value.exitCode
@@ -128,21 +631,248 @@ function crashUploadSummary() {
   while(JSON.stringify(report).length>490){if(report.records.some(r=>r.frames?.length)){for(const r of report.records)delete r.frames}else report.records.shift()}
   return report
 }
-function runGatewaySupervisor() {
+// BEGIN LOGIN AUTOSTART
+// A per-user Windows login entry. No registration happens until the admin opts in.
+function createLoginAutostart(options) {
+  const { home, platform, executable, script, packaged, electron, sourceDir, env, port, host, upstream, run } = options
+  const dir = path.join(home, '.dsh-remote', 'autostart')
+  const launcher = path.join(dir, 'launch.ps1'), configFile = path.join(dir, 'launch.json')
+  const name = 'DSHRemoteGateway'
+  const quote = value => "'" + String(value).replace(/'/g, "''") + "'"
+  const command = `powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "${launcher}"`
+  const registry = async (action, value = '') => {
+    const key = 'Software\\Microsoft\\Windows\\CurrentVersion\\Run'
+    const preamble = `$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$key=${quote(key)};$name=${quote(name)};`
+    const body = action === 'get'
+      ? `$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($key);try{if($null -ne $k){$v=$k.GetValue($name,$null);if($null -ne $v){[Console]::Write([string]$v)}}}finally{if($null -ne $k){$k.Dispose()}}`
+      : action === 'set'
+        ? `$k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($key);try{$k.SetValue($name,${quote(value)},[Microsoft.Win32.RegistryValueKind]::String)}finally{$k.Dispose()}`
+        : `$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($key,$true);try{if($null -ne $k){$k.DeleteValue($name,$false)}}finally{if($null -ne $k){$k.Dispose()}}`
+    return String(await run(preamble + body)).trim()
+  }
+  const atomic = (file, value) => {
+    const temp = file + '.' + crypto.randomBytes(6).toString('hex') + '.tmp'
+    try { fs.writeFileSync(temp, value, { mode: 0o600 }); fs.renameSync(temp, file) }
+    finally { try { fs.unlinkSync(temp) } catch {} }
+  }
+  async function status() {
+    if (platform !== 'win32') return { supported: false, enabled: false, code: 'WINDOWS_ONLY', scope: 'login' }
+    const registered = await registry('get')
+    if (!registered) return { supported: true, enabled: false, scope: 'login' }
+    if (registered !== command) return { supported: true, enabled: false, code: 'STARTUP_CONFLICT', scope: 'login' }
+    try {
+      const config = JSON.parse(fs.readFileSync(configFile, 'utf8'))
+      if (![launcher, config.executable, ...config.args.filter(arg => arg !== '--supervise')].every(file => fs.existsSync(file))) throw Error('missing')
+      return { supported: true, enabled: true, scope: 'login', port: Number(config.env.PORT) }
+    } catch { return { supported: true, enabled: true, code: 'STARTUP_FILES_MISSING', scope: 'login' } }
+  }
+  function prepare() {
+    if (command.length > 260 || /["\r\n]/.test(launcher)) throw Object.assign(Error('登录启动路径过长或含不支持的字符'), { code: 'STARTUP_PATH_INVALID' })
+    if (!fs.existsSync(executable)) throw Object.assign(Error('网关运行时不存在'), { code: 'STARTUP_RUNTIME_MISSING' })
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    // Keep an independent bundle: pnpm may remove the old plugin during upgrades.
+    let previous = null
+    try { previous = JSON.parse(fs.readFileSync(configFile, 'utf8')) } catch {}
+    const digest = crypto.createHash('sha256')
+    digest.update(fs.readFileSync(packaged ? executable : script))
+    for (const file of ['gateway-stats.cjs', 'public/build.json', 'public/version.json']) {
+      try { digest.update(fs.readFileSync(path.join(sourceDir, file))) } catch {}
+    }
+    const fingerprint = digest.digest('hex')
+    let bundle = previous?.fingerprint === fingerprint ? previous.bundle : null
+    if (!bundle || path.dirname(bundle) !== dir || !fs.existsSync(path.join(bundle, packaged ? 'gateway.exe' : 'gateway.cjs'))
+        || (!packaged && !fs.existsSync(path.join(bundle, 'public', 'admin.html')))) {
+      bundle = path.join(dir, 'bundle-' + crypto.randomBytes(8).toString('hex'))
+      fs.mkdirSync(bundle, { mode: 0o700 })
+      if (packaged) fs.copyFileSync(executable, path.join(bundle, 'gateway.exe'))
+      else {
+        fs.copyFileSync(script, path.join(bundle, 'gateway.cjs'))
+        for (const file of ['gateway-stats.cjs', 'public', 'apk']) {
+          const source = path.join(sourceDir, file)
+          if (fs.existsSync(source)) copyTree(source, path.join(bundle, file))
+        }
+      }
+    }
+    const savedEnv = {}
+    for (const [key, value] of Object.entries(env)) {
+      if ((key.startsWith('DSH_REMOTE_') || /^(HOME|USERPROFILE|DSH_HOME|TOKEN|TOKEN_FILE|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|UPDATE_CHECK_URL|UPDATE_PROXY)$/.test(key)) && !/^DSH_REMOTE_SUPERVIS/.test(key)) savedEnv[key] = value
+    }
+    Object.assign(savedEnv, { HOME: home, USERPROFILE: home, PORT: String(port), HOST: host, DSH_UPSTREAM: upstream })
+    if (electron && !packaged) savedEnv.ELECTRON_RUN_AS_NODE = '1'
+    const config = { version: 1, fingerprint, bundle, executable: packaged ? path.join(bundle, 'gateway.exe') : executable,
+      args: packaged ? ['--supervise'] : [path.join(bundle, 'gateway.cjs'), '--supervise'], env: savedEnv }
+    // No credentials or user-controlled shell expressions in the registry command.
+    atomic(launcher, `\ufeff$ErrorActionPreference = 'Stop'\ntry {\n  $c = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'launch.json') -Raw -Encoding UTF8 | ConvertFrom-Json\n  foreach ($p in $c.env.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, [string]$p.Value, 'Process') }\n  Remove-Item Env:NODE_OPTIONS,Env:NODE_CHANNEL_FD,Env:NODE_CHANNEL_SERIALIZATION_MODE,Env:DSH_REMOTE_SUPERVISED,Env:DSH_REMOTE_SUPERVISOR_PID -ErrorAction SilentlyContinue\n  Set-Location -LiteralPath $PSScriptRoot\n  [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n  $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'\n  $ErrorActionPreference = 'Continue'\n  & $c.executable @($c.args) *>> (Join-Path $PSScriptRoot 'gateway.log')\n  exit $LASTEXITCODE\n} catch {\n  Add-Content -LiteralPath (Join-Path $PSScriptRoot 'startup-error.log') -Value ((Get-Date -Format o) + ' STARTUP_FAILED')\n  exit 1\n}\n`)
+    atomic(configFile, JSON.stringify(config, null, 2) + '\n')
+    // Keep the previous bundle for rollback and never delete a running bundle.
+    for (const entry of fs.readdirSync(dir)) {
+      if (!/^bundle-[a-f0-9]{16}$/.test(entry)) continue
+      const target = path.resolve(dir, entry)
+      if (path.dirname(target) !== path.resolve(dir) || target === bundle || target === previous?.bundle
+          || script.startsWith(target + path.sep) || executable.startsWith(target + path.sep)) continue
+      try { if (!fs.lstatSync(target).isSymbolicLink()) fs.rmSync(target, { recursive: true, force: true }) } catch {}
+    }
+  }
+  function copyTree(source, target) {
+    const info = fs.lstatSync(source)
+    if (info.isSymbolicLink()) throw Object.assign(Error('网关资源包含符号链接，无法建立独立启动副本'), { code: 'STARTUP_LINK_UNSUPPORTED' })
+    if (!info.isDirectory()) { fs.copyFileSync(source, target); return }
+    fs.mkdirSync(target, { recursive: true })
+    for (const entry of fs.readdirSync(source)) copyTree(path.join(source, entry), path.join(target, entry))
+  }
+  let busy = false
+  async function change(enabled) {
+    if (typeof enabled !== 'boolean') throw Object.assign(Error('enabled 必须是布尔值'), { code: 'INVALID_ENABLED', status: 400 })
+    if (busy) throw Object.assign(Error('自启设置正在更新，请稍后重试'), { code: 'STARTUP_BUSY', status: 409 })
+    busy = true
+    try {
+      const before = await status()
+      if (!before.supported) throw Object.assign(Error('当前仅支持 Windows 登录自启'), { code: before.code, status: 409 })
+      if (before.code === 'STARTUP_CONFLICT') throw Object.assign(Error('发现其他启动配置，请先在本机检查'), { code: before.code, status: 409 })
+      if (enabled) { prepare(); await registry('set', command) } else await registry('remove')
+      const after = await status()
+      if (after.enabled !== enabled || after.code) throw Object.assign(Error('登录自启设置校验失败'), { code: 'STARTUP_VERIFY_FAILED' })
+      return after
+    } finally { busy = false }
+  }
+  // Refresh only an existing opt-in, e.g. after plugin updates or a port change.
+  async function refresh() {
+    if (platform !== 'win32' || busy || !fs.existsSync(configFile)) return
+    busy = true
+    try { if ((await registry('get')) === command) prepare() } finally { busy = false }
+  }
+  return { status, change, refresh }
+}
+// END LOGIN AUTOSTART
+
+// Legacy leases contain no process birth identity. During migration, compare both
+// the command and its creation time with the lease; kill(pid, 0) alone permits PID reuse.
+async function legacyGatewaySupervisorAlive(owner, modifiedAt) {
+  if(!Number.isSafeInteger(owner?.pid)||owner.pid<=0)return false
+  try{process.kill(owner.pid,0)}catch(error){if(error.code==='ESRCH')return false}
+  const run=(file,args)=>new Promise((resolve,reject)=>execFile(file,args,{windowsHide:true,timeout:5000,maxBuffer:64*1024,encoding:'utf8',env:{...process.env,LC_ALL:'C'}},(error,stdout)=>error?reject(error):resolve(stdout)))
+  let command,started
+  try {
+    if(process.platform==='win32'){
+      const code=`Get-CimInstance Win32_Process -Filter 'ProcessId=${owner.pid}' -ErrorAction Stop | ForEach-Object { [pscustomobject]@{command=$_.CommandLine;started=$_.CreationDate.ToUniversalTime().ToString('o')} } | ConvertTo-Json -Compress`
+      const raw=await run('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(code,'utf16le').toString('base64')])
+      if(!raw.trim())return false
+      const value=JSON.parse(raw.replace(/^\uFEFF/,''));command=value.command;started=Date.parse(value.started)
+    }else{
+      const raw=(await run('ps',['-p',String(owner.pid),'-o','lstart=','-o','command='])).trim()
+      if(!raw)return false
+      started=Date.parse(raw.slice(0,24));command=raw.slice(24).trim()
+    }
+    if(typeof command!=='string'||!Number.isFinite(started))throw Error('identity unavailable')
+  }catch{
+    try{process.kill(owner.pid,0)}catch(error){if(error.code==='ESRCH')return false}
+    throw Object.assign(Error('cannot verify legacy supervisor identity'),{code:'SUPERVISOR_IDENTITY_UNAVAILABLE'})
+  }
+  if(started>modifiedAt+1000)return false // ps has second precision.
+  if(!/(?:^|\s)--supervise(?:\s|$)/.test(command))return false
+  if(process.pkg)return command.toLowerCase().includes(path.basename(process.execPath).toLowerCase())
+  return /(?:^|[\\/\s"'])gateway\.(?:js|cjs)(?:["'\s]|$)/i.test(command)
+}
+
+function supervisorSocketPath(tmpdir,key) {
+  return path.join(tmpdir,'dsh-remote-supervisor-'+key+'.sock')
+}
+function pickSupervisorEndpoint({tmpdir,key,fallback='/tmp'}) {
+  for(const directory of [tmpdir,fallback]){
+    const candidate=supervisorSocketPath(directory,key)
+    // Leave room for sun_path's terminator on macOS (104 bytes including NUL).
+    if(Buffer.byteLength(candidate)<=100)return candidate
+  }
+  throw fault('SUPERVISOR_ENDPOINT_TOO_LONG')
+}
+async function listenSupervisorEndpoint(endpoint,fileSocket) {
+  const lock=net.createServer(socket=>socket.destroy())
+  const listen=()=>new Promise((resolve,reject)=>{
+    const failed=error=>{lock.removeListener('listening',ready);reject(error)}
+    const ready=()=>{lock.removeListener('error',failed);resolve(lock)}
+    lock.once('error',failed);lock.once('listening',ready);lock.listen(endpoint)
+  })
+  try {
+    await listen().catch(async error=>{
+      if(!fileSocket||error.code!=='EADDRINUSE')throw error
+      let before
+      try{before=fs.statSync(endpoint)}catch(error){if(error.code!=='ENOENT')throw error}
+      if(before){
+        const unused=await new Promise(resolve=>{
+          const socket=net.connect(endpoint),done=value=>{socket.destroy();resolve(value)}
+          socket.once('connect',()=>done(false));socket.once('error',e=>done(e.code==='ECONNREFUSED'||e.code==='ENOENT'));socket.setTimeout(1000,()=>done(false))
+        })
+        if(!unused)throw error
+        let now
+        try{now=fs.statSync(endpoint)}catch(error){if(error.code!=='ENOENT')throw error}
+        if(now){if(now.ino!==before.ino||now.mtimeMs!==before.mtimeMs)throw error;fs.unlinkSync(endpoint)}
+      }
+      await listen()
+    })
+    if(fileSocket)fs.chmodSync(endpoint,0o600)
+    return lock
+  }catch(error){
+    if(lock.listening)lock.close()
+    if(fileSocket&&['EINVAL','ENAMETOOLONG'].includes(error.code))throw Object.assign(fault('SUPERVISOR_ENDPOINT_TOO_LONG'),{cause:error})
+    throw error
+  }
+}
+async function lockGatewaySupervisor(lease) {
+  // Key by the real state directory + port, independent of package/cwd upgrades.
+  let identity=path.join(fs.realpathSync(path.dirname(lease)),path.basename(lease))
+  if(process.platform==='win32')identity=identity.toLowerCase()
+  const key=crypto.createHash('sha256').update(identity).digest('hex').slice(0,40)
+  const [major,minor]=process.versions.node.split('.').map(Number)
+  const abstract=process.platform==='linux'&&(major>20||(major===20&&minor>=8))
+  const fileSocket=process.platform!=='win32'&&!abstract,tmpdir=os.tmpdir()
+  // Keep Windows named pipes and Linux abstract names byte-for-byte compatible.
+  const endpoint=process.platform==='win32'?'\\\\.\\pipe\\dsh-remote-supervisor-'+key
+    :abstract?'\0dsh-remote-supervisor-'+key:pickSupervisorEndpoint({tmpdir,key:key.slice(0,16)})
+  const locks=[]
+  try {
+    locks.push(await listenSupervisorEndpoint(endpoint,fileSocket))
+    if(fileSocket){
+      const legacy=supervisorSocketPath(tmpdir,key),limit=process.platform==='linux'?107:103
+      // Also hold an old, usable endpoint: an older binary may start during upgrade.
+      if(legacy!==endpoint&&Buffer.byteLength(legacy)<=limit)locks.push(await listenSupervisorEndpoint(legacy,true))
+    }
+    return {verifyLease:fileSocket,close:()=>{for(const lock of locks)lock.close()}}
+  }catch(error){
+    for(const lock of locks)lock.close()
+    throw error
+  }
+}
+
+async function runGatewaySupervisor() {
   const port=Number(process.env.PORT)||8787,lease=path.join(path.dirname(CRASH_LOG_FILE),'gateway-supervisor-'+port+'.json')
   const nonce=crypto.randomBytes(12).toString('hex')
+  let lock=null
   try {
     fs.mkdirSync(path.dirname(lease),{recursive:true,mode:0o700})
-    if(fs.existsSync(lease)){
-      const old=JSON.parse(fs.readFileSync(lease,'utf8'));let alive=false
-      try{process.kill(old.pid,0);alive=true}catch(e){alive=e.code!=='ESRCH'}
-      if(alive){console.error('[recovery] supervisor already running');process.exit(78)}
-      fs.unlinkSync(lease)
+    lock=await lockGatewaySupervisor(lease)
+    let old=null,modifiedAt=0,recovered=''
+    try{
+      const raw=fs.readFileSync(lease,'utf8');modifiedAt=fs.statSync(lease).mtimeMs
+      try{old=JSON.parse(raw);recovered='SUPERVISOR_LEASE_STALE'}catch{recovered='SUPERVISOR_LEASE_INVALID'}
+    }catch(error){if(error.code!=='ENOENT')throw error}
+    // File endpoints may move after shortening or TMPDIR fallback. Check even v2
+    // leases during that migration, using command + birth identity, never PID alone.
+    // Named pipes/abstract locks retain their names and remain authoritative for v2.
+    if((old?.version!==2||lock.verifyLease)&&await legacyGatewaySupervisorAlive(old,modifiedAt)){
+      throw Object.assign(Error('supervisor already running'),{code:'SUPERVISOR_ALREADY_RUNNING'})
     }
-    fs.writeFileSync(lease,JSON.stringify({pid:process.pid,nonce}),{flag:'wx',mode:0o600})
-  } catch {console.error('[recovery] cannot acquire supervisor lease');process.exit(78)}
+    const temporary=lease+'.'+nonce+'.tmp'
+    try{fs.writeFileSync(temporary,JSON.stringify({version:2,pid:process.pid,nonce}),{flag:'wx',mode:0o600});fs.renameSync(temporary,lease)}
+    finally{try{fs.unlinkSync(temporary)}catch{}}
+    if(recovered){console.error('[recovery] reclaimed stale supervisor lease');recordCrash('gateway','lease-recovered',{code:recovered})}
+  } catch(error){
+    const conflict=error.code==='EADDRINUSE'||error.code==='SUPERVISOR_ALREADY_RUNNING'
+    recordCrash('gateway',conflict?'lease-conflict':'lease-failed',{exitCode:78,code:conflict?'SUPERVISOR_ALREADY_RUNNING':CRASH_CODES.has(error.code)?error.code:'INTERNAL_ERROR'})
+    console.error(conflict?'[recovery] supervisor already running':'[recovery] cannot acquire supervisor lease ('+(CRASH_CODES.has(error.code)?error.code:'INTERNAL_ERROR')+')')
+    lock?.close();process.exit(78);return
+  }
   let worker=null,stopping=false,timer=null,attempts=[]
-  const cleanup=()=>{try{if(JSON.parse(fs.readFileSync(lease,'utf8')).nonce===nonce)fs.unlinkSync(lease)}catch{}}
+  const cleanup=()=>{try{if(JSON.parse(fs.readFileSync(lease,'utf8')).nonce===nonce)fs.unlinkSync(lease)}catch{};lock.close()}
   process.once('exit',cleanup)
   const stop=()=>{if(stopping)return;stopping=true;clearTimeout(timer);recordCrash('gateway','manual-stop');if(worker)worker.kill();else process.exit(0)}
   process.on('SIGTERM',stop);process.on('SIGINT',stop)
@@ -168,7 +898,7 @@ function runGatewaySupervisor() {
   launch()
 }
 if(process.argv.includes('--supervise')&&process.env.DSH_REMOTE_SUPERVISED!=='1'){
-  runGatewaySupervisor()
+  void runGatewaySupervisor()
 }else{
 
 
@@ -192,6 +922,12 @@ const ANNOUNCEMENTS_CACHE_MS = durationEnv('DSH_REMOTE_ANNOUNCEMENTS_CACHE_MS', 
 const ANNOUNCEMENTS_MAX_BYTES = 512 * 1024
 const PORT = Number(process.env.PORT) || 8787
 const HOST = process.env.HOST || '0.0.0.0'
+const relayHost = new embeddedRelayHost.RelayHost({
+  root: process.env.DSH_REMOTE_RELAY_STATE || path.join(os.homedir(), '.dsh-remote', 'relay-pilot', 'integrated'),
+  gateway: `http://127.0.0.1:${PORT}`,
+  origin: process.env.DSH_REMOTE_RELAY_ORIGIN || embeddedRelayHost.DEFAULT_ORIGIN,
+  ca: process.env.DSH_REMOTE_RELAY_CA_FILE ? fs.readFileSync(process.env.DSH_REMOTE_RELAY_CA_FILE) : undefined,
+})
 
 function durationEnv(name, fallback, min, max) {
   const raw = process.env[name]
@@ -219,6 +955,7 @@ const DSH_HEALTH_PATH = String(process.env.DSH_HEALTH_PATH || '/').startsWith('/
   : '/' + String(process.env.DSH_HEALTH_PATH)
 const DSH_UPSTREAM_COOKIE_FILE = process.env.DSH_REMOTE_DSH_COOKIE_FILE || path.join(os.homedir(), '.dsh-remote', 'dsh-upstream.cookie')
 const TOKEN_FILE = process.env.TOKEN_FILE || path.join(os.homedir(), '.dsh-remote', 'token')
+const DSH_CONTROL_DIR = path.join(path.dirname(TOKEN_FILE), 'lifecycle-' + PORT)
 const NOTES_FILE = process.env.DSH_REMOTE_NOTES || path.join(os.homedir(), '.dsh-remote', 'device-notes.json')
 const DEVICE_KEYS_FILE = process.env.DSH_REMOTE_DEVICE_KEYS || path.join(os.homedir(), '.dsh-remote', 'device-keys.json')
 const WORKBENCH_FILE = process.env.DSH_REMOTE_WORKBENCH || path.join(os.homedir(), '.dsh-remote', 'workbench.json')
@@ -320,6 +1057,9 @@ const PROTOCOL_VERSION = 1
 const CAPABILITIES = Object.freeze({
   wsTicket: 1,
   eventPolling: 1,
+  eventEpoch: 1,
+  operations: 1,
+  cloudRelay: 1,
   workspaceFiles: 2,
   imagePromptTransport: 1,
   dshLifecycle: DSH_CONTROL_SUPPORT.supported ? 2 : 0,
@@ -382,7 +1122,7 @@ let fsWorkspaceRootsCache = { roots: [], reals: [], fetchedAt: 0 }
 let fsWorkspaceRootsFetch = null
 function fsRootReals() {
   if (!FS_ROOT_REALS) {
-    FS_ROOT_REALS = FS_ROOTS.map(r => { try { return fs.realpathSync(r) } catch { return null } }).filter(Boolean)
+    FS_ROOT_REALS = FS_ROOTS.map(r => { try { return (fs.realpathSync.native || fs.realpathSync)(r) } catch { return null } }).filter(Boolean)
   }
   return FS_ROOT_REALS
 }
@@ -397,17 +1137,28 @@ function fsInsideReal(real) {
 // 网关自身的状态与安装目录永远不出现在 /fs 通道里: 设备密钥同样能访问 /fs,
 // 若允许读取就等同于把主令牌(以及其它设备密钥)直接交出去, 允许写入还能替换
 // 正在对外提供的静态资源或网关文件。显式配置到其它位置的状态文件按精确路径保护。
+function fsCanonicalPath(value) {
+  let current = path.resolve(value)
+  const suffix = []
+  while (true) {
+    try { return path.join((fs.realpathSync.native || fs.realpathSync)(current), ...suffix) }
+    catch (error) {
+      const parent = path.dirname(current)
+      if (!['ENOENT', 'ENOTDIR'].includes(error.code) || parent === current) return path.resolve(value)
+      suffix.unshift(path.basename(current)); current = parent
+    }
+  }
+}
 const FS_PROTECTED_DIRS = [...new Set([
   path.resolve(path.join(FS_DEFAULT_ROOT, '.dsh-remote')),
   path.resolve(ROOT),
-])]
+  path.resolve(DSH_CONTROL_DIR),
+].flatMap(value => [value, fsCanonicalPath(value)]))]
 const FS_PROTECTED_FILES = [...new Set([TOKEN_FILE, DEVICE_KEYS_FILE, NOTES_FILE, WORKBENCH_FILE,
-  HANDOFF_FILE, DSH_UPSTREAM_COOKIE_FILE, DSH_LAUNCH_FILE].filter(Boolean).map(value => path.resolve(String(value))))]
+  HANDOFF_FILE, DSH_UPSTREAM_COOKIE_FILE, DSH_LAUNCH_FILE].filter(Boolean).flatMap(value => [path.resolve(String(value)), fsCanonicalPath(String(value))]))]
 
 function fsSamePath(left, right) {
-  const a = path.resolve(String(left || ''))
-  const b = path.resolve(String(right || ''))
-  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
+  return fsInsideRoot(left, right) && fsInsideRoot(right, left)
 }
 
 /** 路径是否命中受保护目录(目录内全部)或受保护文件(精确匹配)。realpath 结果同样适用。 */
@@ -464,6 +1215,19 @@ const FS_PREVIEW_EXTENSIONS = new Set([
   '.kts', '.go', '.rs', '.c', '.h', '.cpp', '.hpp', '.cs', '.php', '.rb', '.vue',
   '.svelte', '.gradle', '.properties', '.gitignore', '.dockerfile'
 ])
+
+const loginAutostart = createLoginAutostart({
+  home: os.homedir(), platform: process.platform, executable: process.execPath,
+  script: __filename, packaged: !!process.pkg, electron: !!process.versions.electron,
+  sourceDir: ROOT, env: process.env, port: PORT, host: HOST, upstream: UPSTREAM.origin,
+  run: code => new Promise((resolve, reject) => {
+    execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')],
+      { windowsHide: true, timeout: 15000, maxBuffer: 64 * 1024, encoding: 'utf8' }, (error, stdout) => {
+        if (error) reject(Object.assign(new Error('无法读取或更新 Windows 登录自启，请在主机上检查系统权限'), { code: 'STARTUP_SYSTEM_ERROR' }))
+        else resolve(stdout)
+      })
+  }),
+})
 
 // ---------- token ----------
 function loadToken() {
@@ -948,7 +1712,8 @@ function httpGetJson(url, cb) {
       agent
     }, (res) => {
       let body = ''
-      res.on('data', c => { body += c; if (body.length > 512 * 1024) res.destroy() })
+      res.setEncoding('utf8')
+      res.on('data', c => { body += c; if (Buffer.byteLength(body) > 512 * 1024) res.destroy() })
       res.on('end', () => {
         if (res.statusCode >= 400) return done(new Error('HTTP ' + res.statusCode))
         try { done(null, JSON.parse(body)) } catch (e) { done(e) }
@@ -989,7 +1754,8 @@ function httpGetJson(url, cb) {
         headers: { host: u.host, 'user-agent': 'dsh-remote-gateway/' + VERSION, accept: 'application/json' }
       }, (res) => {
         let body = ''
-        res.on('data', c => { body += c; if (body.length > 512 * 1024) res.destroy() })
+        res.setEncoding('utf8')
+        res.on('data', c => { body += c; if (Buffer.byteLength(body) > 512 * 1024) res.destroy() })
         res.on('end', () => {
           if (res.statusCode >= 400) return done(new Error('HTTP ' + res.statusCode))
           try { done(null, JSON.parse(body)) } catch (e) { done(e) }
@@ -1070,8 +1836,8 @@ function readBody(req, maxBytes = 64 * 1024) {
       size += chunk.length
       if (size > maxBytes) {
         settled = true
-        reject(new Error('request body too large'))
-        req.destroy()
+        chunks.length = 0
+        reject(Object.assign(new Error('request body too large'), { status: 413, code: 'body-too-large' }))
         return
       }
       chunks.push(chunk)
@@ -1086,6 +1852,19 @@ function readBody(req, maxBytes = 64 * 1024) {
       settled = true
       reject(err)
     })
+    req.once('aborted', () => {
+      if (settled) return
+      settled = true
+      reject(Object.assign(new Error('request aborted'), { status: 400, code: 'request-aborted' }))
+    })
+  })
+}
+
+function withRequestBody(req, res, limit, callback) {
+  void readBody(req, limit).then(callback).catch(error => {
+    if (res.writableEnded || res.destroyed) return
+    if (res.headersSent) return res.destroy()
+    fsJson(res, error.status || 500, { error: error.status === 413 ? 'body-too-large' : 'bad-request' }, { connection: 'close' })
   })
 }
 
@@ -1479,6 +2258,113 @@ async function probeDshUpstream(timeoutMs = 2500) {
 }
 
 let dshControlOperation = null
+const dshControlOwner = crypto.randomUUID()
+const validDshOperationId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{16,80}$/.test(id)
+function dshControlSnapshot(operation) {
+  if (!operation) return null
+  const { owner, target, commandIssued, ...publicValue } = operation
+  return { ...publicValue, elapsedMs: operation.done ? operation.elapsedMs : Date.now() - operation.startedAt }
+}
+function readDshControlRecord(id) {
+  if (!validDshOperationId(id)) return null
+  try {
+    const file = path.join(DSH_CONTROL_DIR, id + '.json')
+    if (fs.statSync(file).size > 128 * 1024) return null
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'))
+    return value.operationId === id && Number.isFinite(value.startedAt) && Date.now() - value.startedAt < 86400000 ? value : null
+  } catch { return null }
+}
+function withDshControlLock(fn) {
+  fs.mkdirSync(DSH_CONTROL_DIR, { recursive: true, mode: 0o700 })
+  const lock = path.join(DSH_CONTROL_DIR, 'lock')
+  let fd
+  try { fd = fs.openSync(lock, 'wx', 0o600) } catch (error) {
+    if (error.code !== 'EEXIST') throw error
+    const pid = Number(fs.readFileSync(lock, 'utf8'))
+    if (!Number.isSafeInteger(pid) || pid <= 1) throw error
+    try { process.kill(pid, 0); throw error } catch (probe) { if (probe.code !== 'ESRCH') throw error }
+    fs.unlinkSync(lock); fd = fs.openSync(lock, 'wx', 0o600)
+  }
+  try { fs.writeFileSync(fd, String(process.pid)); return fn() }
+  finally { fs.closeSync(fd); fs.unlinkSync(lock) }
+}
+function saveDshControlRecord(operation, claim = false) {
+  return withDshControlLock(() => {
+    const previous = readDshControlRecord(operation.operationId)
+    if (previous && previous.owner !== operation.owner && !claim) throw Object.assign(new Error('Lifecycle ownership transferred'), { code: 'CONTROL_HANDED_OFF' })
+    if (claim) operation.owner = dshControlOwner
+    const file = path.join(DSH_CONTROL_DIR, operation.operationId + '.json'), tmp = file + '.' + dshControlOwner + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(operation), { mode: 0o600 }); fs.renameSync(tmp, file)
+    const pointer = path.join(DSH_CONTROL_DIR, 'current'), pointerTmp = pointer + '.' + dshControlOwner + '.tmp'
+    fs.writeFileSync(pointerTmp, operation.operationId, { mode: 0o600 }); fs.renameSync(pointerTmp, pointer)
+  })
+}
+function dshControlTarget(status) {
+  if (status.manager === 'desktop') {
+    const config = readDshLaunch()
+    return { manager: 'desktop', executable: config.executable, profilePath: config.desktop.profilePath,
+      pid: config.desktop.root.pid, started: config.desktop.root.started }
+  }
+  return { manager: status.manager, service: status.service, pid: status.mainPid || 0 }
+}
+function dshRecoveryMatches(operation, status) {
+  const target = operation.target
+  if (!operation.commandIssued || !target || !status.supported || !status.running) return false
+  if (target.manager === 'desktop') {
+    const config = readDshLaunch()
+    return status.manager === 'desktop' && status.canRestart === true && config.kind === 'desktop' &&
+      fsSamePath(config.executable, target.executable) && fsSamePath(config.desktop.profilePath, target.profilePath) &&
+      Date.parse(config.desktop.root.started) >= operation.startedAt - 1000 &&
+      (!target.expectedPid || config.desktop.root.pid === target.expectedPid) &&
+      (operation.action === 'start' || config.desktop.root.pid !== target.pid || config.desktop.root.started !== target.started)
+  }
+  return status.manager === target.manager && status.service === target.service && status.mainPid > 0 &&
+    (operation.action === 'start' || status.mainPid !== target.pid)
+}
+function desktopHandoffPending(operation) {
+  if (operation.target?.manager !== 'desktop' || !operation.commandIssued) return false
+  try {
+    const config = JSON.parse(fs.readFileSync(DSH_LAUNCH_FILE, 'utf8')), target = operation.target
+    return config.version === 1 && config.kind === 'desktop' && config.upstream !== UPSTREAM.origin &&
+      fsSamePath(config.executable, target.executable) && fsSamePath(config.desktop.profilePath, target.profilePath) &&
+      Date.parse(config.desktop.root.started) >= operation.startedAt - 1000 &&
+      (!target.expectedPid || config.desktop.root.pid === target.expectedPid) &&
+      (config.desktop.root.pid !== target.pid || config.desktop.root.started !== target.started)
+  } catch { return false }
+}
+async function reconcileDshControl(operation) {
+  // A recovered receipt is observation-only: never replay the lifecycle command.
+  try {
+    while (Date.now() < operation.deadlineAt) {
+      const status = await dshServiceStatus()
+      if (dshRecoveryMatches(operation, status)) {
+        const upstream = await probeDshUpstream(), events = dshEventChannelStatus()
+        if (upstream.ok && events.ok) {
+          dshOperationStep(operation, 'complete', '重启后已核验 DSH 进程、HTTP 与实时通道', { done: true, ok: true, code: 'SUCCESS', status, upstream, events,
+            evidence: { observed: status, upstream, events } })
+          return
+        }
+      }
+      await delay(DSH_CONTROL_POLL_MS)
+    }
+    dshOperationStep(operation, 'unknown', '重启结果待确认，请检查主机状态；未重复执行命令', { done: true, ok: false, code: 'RESULT_UNKNOWN' })
+  } catch (error) {
+    if (error.code === 'CONTROL_HANDED_OFF') return
+    try { dshOperationStep(operation, 'unknown', '无法确认原操作结果；未重复执行命令', { done: true, ok: false, code: 'RESULT_UNKNOWN' }) } catch {}
+  }
+}
+function restoreDshControl() {
+  if (dshControlOperation) return
+  try {
+    const id = fs.readFileSync(path.join(DSH_CONTROL_DIR, 'current'), 'utf8'), operation = readDshControlRecord(id)
+    if (!operation) return
+    if (!operation.done) {
+      saveDshControlRecord(operation, true)
+      dshControlOperation = operation
+      void reconcileDshControl(operation)
+    } else dshControlOperation = operation
+  } catch {}
+}
 
 // Owned children expose abnormal exit codes. Adopted Desktop instances require an exact Windows crash event.
 const recoveryAttempts=new Map(),recoveryTimers=new Map()
@@ -1564,6 +2450,7 @@ function dshOperationStep(operation, stage, message, extra = {}) {
   Object.assign(operation, extra)
   if (operation.done) operation.elapsedMs = now - operation.startedAt
   operation.steps.push({ stage, message, at: now, elapsedMs: now - operation.startedAt })
+  if (operation.owner) saveDshControlRecord(operation)
 }
 
 function failDshOperation(operation, code, message, detail = '', status = null) {
@@ -1600,6 +2487,7 @@ async function runDshControlOperation(operation) {
     const initial = await dshServiceStatus()
     operation.initialStatus = initial
     operation.observed = initial
+    operation.target = dshControlTarget(initial)
     const manager = initial.manager === 'desktop' ? 'DSH Desktop' : initial.manager === 'process' ? '本机进程' : process.platform === 'win32' ? 'Windows 服务' : 'systemd 用户服务'
     operation.service = initial.service
     if (!initial.supported) {
@@ -1607,10 +2495,13 @@ async function runDshControlOperation(operation) {
       return
     }
     dshOperationStep(operation, 'command', `正在向 ${manager} 提交 DSH ${operation.action === 'start' ? '启动' : '重启'}命令`)
+    operation.commandIssued = true
+    if (operation.owner) saveDshControlRecord(operation)
     const command = operation.action === 'start' && initial.running
       ? { ok: true, code: 'ALREADY_RUNNING' }
       : await executeDshServiceAction(operation.action, initial)
     operation.command = { ok: command.ok, code: command.code, signal: command.signal }
+    if (command.pid && operation.target?.manager === 'desktop') operation.target.expectedPid = command.pid
     if (!command.ok) {
       const failure = ['process','desktop'].includes(initial.manager)
         ? { code: command.code, message: command.error, detail: '' }
@@ -1627,13 +2518,18 @@ async function runDshControlOperation(operation) {
     let lastEventReconnectAt = 0
     let lastStatus = initial
     let lastProbe = null
-    const deadline = Date.now() + DSH_CONTROL_TIMEOUT_MS
+    const deadline = operation.deadlineAt || Date.now() + DSH_CONTROL_TIMEOUT_MS
     while (Date.now() < deadline) {
       const status = await dshServiceStatus()
       lastStatus = status
       operation.status = status
       operation.observed = status
       if (!status.supported) {
+        if (desktopHandoffPending(operation)) {
+          if (operation.stage !== 'waiting-gateway') dshOperationStep(operation, 'waiting-gateway', 'Desktop 端口已更新，正在等待新网关接续核验')
+          await delay(DSH_CONTROL_POLL_MS)
+          continue
+        }
         failDshOperation(operation, status.code || 'STATUS_FAILED', status.message || '无法读取 DSH 服务状态', status.detail, status)
         return
       }
@@ -1671,6 +2567,10 @@ async function runDshControlOperation(operation) {
       }
       await delay(DSH_CONTROL_POLL_MS)
     }
+    if (desktopHandoffPending(operation)) {
+      dshOperationStep(operation, 'unknown', '网关交接结果待确认；未重复执行重启命令', { done: true, ok: false, code: 'RESULT_UNKNOWN' })
+      return
+    }
     if (!lastStatus.running || !restartObserved) {
       const reason = operation.action === 'restart' && !restartObserved
         ? `未观察到 ${initial.service} 进程完成重启（初始 PID ${initialPid || '未知'}，当前 PID ${lastStatus.mainPid || '未知'}）`
@@ -1692,7 +2592,9 @@ async function runDshControlOperation(operation) {
     }
     failDshOperation(operation, 'UPSTREAM_TIMEOUT', `服务进程已运行，但 DSH HTTP 接口在 ${Math.round(DSH_CONTROL_TIMEOUT_MS / 1000)} 秒内未恢复`, lastProbe?.error || '', lastStatus)
   } catch (err) {
-    failDshOperation(operation, 'INTERNAL_ERROR', 'DSH 控制流程发生未预期错误', String(err?.stack || err))
+    if (err.code === 'CONTROL_HANDED_OFF') return
+    try { failDshOperation(operation, 'INTERNAL_ERROR', 'DSH 控制流程发生未预期错误', String(err?.stack || err)) }
+    catch { Object.assign(operation, { done: true, ok: false, stage: 'unknown', code: 'RESULT_UNKNOWN', message: '无法确认操作结果；未重复执行命令' }) }
   }
 }
 
@@ -1712,27 +2614,26 @@ async function serveDshControl(req, res, url) {
     return
   }
   touchDevice(req, { kind: 'admin' })
+  restoreDshControl()
   if (req.method === 'GET') {
     const operationId = String(url.searchParams.get('operation') || '').trim()
     cors(res)
     if (operationId) {
-      if (!dshControlOperation || dshControlOperation.operationId !== operationId) {
+      const operation = dshControlOperation?.operationId === operationId ? dshControlOperation : readDshControlRecord(operationId)
+      if (!operation) {
         res.writeHead(404, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(JSON.stringify({ ok: false, done: true, code: 'OPERATION_NOT_FOUND', error: '找不到该 DSH 控制操作，网关可能已重启' }))
         return
       }
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
       res.end(JSON.stringify({
-        ...dshControlOperation,
-        elapsedMs: dshControlOperation.done
-          ? dshControlOperation.elapsedMs
-          : Date.now() - dshControlOperation.startedAt,
+        ...dshControlSnapshot(operation),
       }))
       return
     }
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
     const status = await dshServiceStatus()
-    res.end(JSON.stringify({ ...status, operation: dshControlOperation && !dshControlOperation.done ? dshControlOperation : null }))
+    res.end(JSON.stringify({ ...status, operation: dshControlOperation && !dshControlOperation.done ? dshControlSnapshot(dshControlOperation) : null }))
     return
   }
   if (req.method !== 'POST') {
@@ -1749,32 +2650,46 @@ async function serveDshControl(req, res, url) {
     return
   }
   const action = body?.action
+  const operationId = body.requestId === undefined ? crypto.randomUUID() : body.requestId
+  if (!validDshOperationId(operationId)) {
+    cors(res); res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ code: 'INVALID_REQUEST_ID', error: 'requestId 无效' })); return
+  }
   if (action !== 'start' && action !== 'restart') {
     cors(res)
     res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify({ ok: false, code: 'INVALID_ACTION', error: 'action 必须是 start 或 restart' }))
     return
   }
+  const previous = readDshControlRecord(operationId)
+  if (previous) {
+    cors(res); res.writeHead(previous.action === action ? 200 : 409, { 'content-type': 'application/json' })
+    res.end(JSON.stringify(previous.action === action ? dshControlSnapshot(previous) : { code: 'IDEMPOTENCY_CONFLICT', error: 'requestId 已用于其他操作' })); return
+  }
   if (dshControlOperation && !dshControlOperation.done) {
     cors(res)
     res.writeHead(409, { 'content-type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify({ ok: false, code: 'OPERATION_IN_PROGRESS', error: '已有 DSH 控制操作正在执行', operation: dshControlOperation }))
+    res.end(JSON.stringify({ ok: false, code: 'OPERATION_IN_PROGRESS', error: '已有 DSH 控制操作正在执行', operation: dshControlSnapshot(dshControlOperation) }))
     return
   }
   const now = Date.now()
   dshControlOperation = {
-    operationId: crypto.randomUUID(), action, service: DSH_SERVICE,
+    operationId, owner: dshControlOwner, action, service: DSH_SERVICE,
     desired: { service: DSH_SERVICE, running: true, action },
     observed: null,
     evidence: null,
     ok: false, accepted: true, done: false, stage: 'queued', code: 'ACCEPTED',
     message: `已接收 DSH ${action === 'start' ? '启动' : '重启'}请求，等待检查服务`,
-    startedAt: now, updatedAt: now, steps: [],
+    startedAt: now, updatedAt: now, deadlineAt: now + DSH_CONTROL_TIMEOUT_MS, steps: [],
   }
-  setImmediate(() => { void runDshControlOperation(dshControlOperation) })
+  try { saveDshControlRecord(dshControlOperation) } catch {
+    dshControlOperation = null
+    cors(res); res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ code: 'RECEIPT_UNAVAILABLE', error: '无法保存控制回执，未执行命令' })); return
+  }
+  const operation = dshControlOperation
+  setImmediate(() => { void runDshControlOperation(operation) })
   cors(res)
   res.writeHead(202, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-  res.end(JSON.stringify(dshControlOperation))
+  res.end(JSON.stringify(dshControlSnapshot(operation)))
 }
 
 // ---------- 事件轮询缓冲 ----------
@@ -1787,6 +2702,8 @@ const EVENT_MAX_STRING = 16 * 1024
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const eventBuffers = { mux: [], host: [] }
 const eventNextSeq = { mux: 1, host: 1 }
+const EVENT_STREAM_EPOCH = crypto.randomUUID()
+const WS_CLIENT_BUFFER_MAX = durationEnv('GATEWAY_WS_CLIENT_BUFFER_MAX', 2 * 1024 * 1024, 65536, 16 * 1024 * 1024)
 const collectorClients = { mux: new Set(), host: new Set() }
 const collectorReplay = { mux: new Map(), host: new Map() }
 const eventPollWaiters = { mux: new Set(), host: new Set() }
@@ -1856,12 +2773,15 @@ function scheduleCompatibleCollectorRestart() {
 }
 const modernState = {
   home: '',
+  hostInfo: { version: null, cwd: null, attachedSessions: null },
   eventClientId: '',
   sessions: new Map(),
   sessionCursors: new Map(),
   workspaces: { items: [], archivedSessionIds: [] },
   pendingEvents: new Map(),
   assistantStreams: new Map(),
+  sessionInterests: new Map(),
+  followedSessions: new Set(),
 }
 
 async function callUpstreamRemote(endpoint, args, rpcId = crypto.randomUUID()) {
@@ -1923,8 +2843,9 @@ function updateModernSessions(items) {
     if (!item?.sessionId) continue
     modernState.sessions.set(item.sessionId, item)
     const cursor = Number(item.projections?.asOfSeq)
-    if (Number.isSafeInteger(cursor) && cursor >= -1) modernState.sessionCursors.set(item.sessionId, cursor)
+    if (modernState.followedSessions?.has(item.sessionId) && item.projections?.kind !== 'cached' && Number.isSafeInteger(cursor) && cursor >= -1) modernState.sessionCursors.set(item.sessionId, cursor)
   }
+  eventCollectors.mux?.syncSessions?.()
 }
 
 function legacyEnvelope(rpcId, result) {
@@ -1967,13 +2888,55 @@ async function refreshModernSessions() {
   return response
 }
 
-async function translateModernRpc(method, payload, rpcId) {
+// The permission catalog mixes configured presets, the live experimental `auto`
+// contribution and derived `custom`. Remote republishes only rows a client can
+// render, with bounded text; `custom` is display-only and never a switch target.
+function modernPermissionCatalog(value) {
+  const option = item => {
+    const row = item && typeof item === 'object' ? item : {}
+    const name = typeof row.value === 'string' ? row.value.trim() : ''
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) return null
+    const label = typeof row.name === 'string' && row.name.trim() ? row.name.trim().slice(0, 80) : name
+    const description = typeof row.description === 'string' ? row.description.trim().slice(0, 400) : ''
+    return { value: name, name: label, ...(description ? { description } : {}) }
+  }
+  const rows = (list, limit) => Array.isArray(list)
+    ? list.slice(0, limit).map(option).filter(row => row && row.value !== 'custom')
+    : []
+  return {
+    options: rows(value?.options, 20),
+    defaultOptions: rows(value?.defaultOptions, 20),
+    defaultPreset: typeof value?.defaultPreset === 'string' ? value.defaultPreset.slice(0, 64) : '',
+  }
+}
+
+async function translateModernRpc(method, payload, rpcId, strictReceipt = false) {
+  const migrationFailure = response => method === 'session.history' && /cannot safely transform unclassified message source|migration-required|source v0 artifact remains unchanged/i.test(JSON.stringify(response.body?.result?.error || {}))
+  const migrationReply = () => legacyEnvelope(rpcId, modernError('The source session format cannot be migrated by DSH. Update DSH and open the original session there before retrying; Remote will not rewrite its log.', 'session/migration-required', { sessionId: payload.sessionId }))
   let endpoint = ''
   let args = {}
   let transform = value => value
 
   if (method === 'host.describe') {
-    return legacyEnvelope(rpcId, { ok: true, value: { home: modernState.home || os.homedir(), canOpenPath: false } })
+    // Modern ready frames often contain only home. Ask our plugin in the Host
+    // for process metadata; an older/missing plugin keeps the known WS fields.
+    const host = { ...modernState.hostInfo, home: modernState.home || null }
+    try {
+      const response = await fetch(new URL('/remote/api/host-description', UPSTREAM), {
+        headers: dshUpstreamHeaders({ authorization: 'Bearer ' + TOKEN }),
+        signal: AbortSignal.timeout(3000), redirect: 'error',
+      })
+      if (response.ok) {
+        const value = await response.json()
+        if (value.ok === true && value.metadataOnly === true) {
+          for (const [key, limit] of [['version', 100], ['cwd', 2000], ['home', 2000]]) {
+            if (typeof value[key] === 'string' && value[key]) host[key] = value[key].slice(0, limit)
+          }
+          if (Number.isSafeInteger(value.attachedSessions) && value.attachedSessions >= 0) host.attachedSessions = value.attachedSessions
+        }
+      } else await response.body?.cancel()
+    } catch {}
+    return legacyEnvelope(rpcId, { ok: true, value: { ...host, canOpenPath: false, metadataOnly: true } })
   }
   if (method === 'workspace.list') {
     return legacyEnvelope(rpcId, { ok: true, value: modernState.workspaces })
@@ -1989,18 +2952,34 @@ async function translateModernRpc(method, payload, rpcId) {
       await refreshModernSessions()
       summary = modernState.sessions.get(payload.sessionId)
     }
-    const throughSeq = modernState.sessionCursors.get(payload.sessionId) ?? Number(summary?.projections?.asOfSeq)
+    if (summary?.formatStatus === 'migration-required') return legacyEnvelope(rpcId, modernError('Open the source session in DSH to complete migration, then refresh.', 'session/migration-required', { sessionId: payload.sessionId }))
+    const isChild = !!payload.parentSessionId && typeof payload.subagentMode === 'string'
+    let throughSeq = modernState.sessionCursors.get(payload.sessionId) ?? Number(summary?.projections?.asOfSeq)
+    if (isChild || summary?.projections?.kind === 'cached' || !modernState.followedSessions?.has(payload.sessionId)) {
+      // Cached storage watermarks are not connected stream sequence numbers.
+      // Child logs also need a fresh durable cursor and Host address validation.
+      const projection = await callUpstreamRemote('session/projections', { request: { sessionId: payload.sessionId } }, rpcId)
+      if (!projection.body?.result?.ok) return migrationFailure(projection) ? migrationReply() : projection.body || legacyEnvelope(rpcId, modernError('DSH history cursor unavailable'))
+      if (projection.body.result.value?.kind === 'migration-required') return legacyEnvelope(rpcId, modernError('Open the source session in DSH to complete migration, then refresh.', 'session/migration-required', { sessionId: payload.sessionId }))
+      throughSeq = projection.body.result.value?.asOfSeq
+      if (projection.body.result.value) summary = { ...summary, projections: projection.body.result.value }
+    }
     if (!Number.isSafeInteger(throughSeq) || throughSeq < -1) {
       return legacyEnvelope(rpcId, modernError('DSH did not expose a history cursor for this session', 'session-not-found'))
     }
     endpoint = 'session/page'
     args = { request: {
-      address: { kind: 'session', sessionId: payload.sessionId },
+      address: isChild
+        ? { kind: 'subagent', parentSessionId: payload.parentSessionId, childSessionId: payload.sessionId, mode: ['one-shot', 'continuable'].includes(payload.subagentMode) ? payload.subagentMode : 'unknown' }
+        : { kind: 'session', sessionId: payload.sessionId },
       throughSeq,
       ...(payload.beforeSeq === undefined ? {} : { beforeSeq: payload.beforeSeq }),
       ...(payload.maxMessages === undefined ? {} : { maxMessages: payload.maxMessages }),
     } }
-    transform = value => ({ ...legacyHistoryValue(value, summary), ...modernReasoningValue(payload.sessionId) })
+    transform = value => {
+      if (!isChild) requestModernSessionStream(payload.sessionId)
+      return { ...legacyHistoryValue(value, summary), ...modernReasoningValue(payload.sessionId) }
+    }
   } else if (method === 'session.models') {
     endpoint = 'session/modelCatalog'
     args = {}
@@ -2015,6 +2994,13 @@ async function translateModernRpc(method, payload, rpcId) {
         failures: catalog?.failures || [],
       }
     }
+  } else if (method === 'agentPresets.list') {
+    endpoint = 'agentPresets/list'
+    args = {}
+  } else if (method === 'permissionPresets.catalog') {
+    endpoint = 'permissionPresets/catalog'
+    args = {}
+    transform = modernPermissionCatalog
   } else if (method.startsWith('session.')) {
     const verb = method.slice('session.'.length)
     if (!['search', 'create', 'selectModel', 'rename', 'fork', 'prompt', 'attachment', 'updateQueue', 'cancel'].includes(verb)) return legacyFallback('no generated RPC adapter')
@@ -2090,12 +3076,21 @@ async function translateModernRpc(method, payload, rpcId) {
   }
 
   let response = await callUpstreamRemote(endpoint, args, rpcId)
+  let receiptStage = 'modern-request'
+  if (strictReceipt && ((response.status >= 500 && response.status !== 501) || (typeof response.body?.result?.ok !== 'boolean' && ![404,405,501].includes(response.status)))) throw Object.assign(new Error('upstream-uncertain'), { httpStatus: response.status, receiptCategory: response.status >= 500 ? 'upstream-http' : 'invalid-response', receiptStage })
   if (method === 'session.prompt' && imageAdmissionRejected(response.body)) {
+    let bridged
     try {
-      const bridged = await bridgeVisionPrompt(args.request)
-      if (bridged) response = await callUpstreamRemote(endpoint, { ...args, request: bridged }, rpcId)
+      bridged = await bridgeVisionPrompt(args.request)
     } catch (error) {
-      return legacyEnvelope(rpcId, modernError(error.message, 'image-vision-failed'))
+      // The original image request was explicitly rejected and no replacement
+      // prompt has been submitted. Preparation failure is a known rejection.
+      return legacyEnvelope(rpcId, modernError(error.message, 'image-vision-failed', { reason: error.code }))
+    }
+    if (bridged) {
+      receiptStage = 'vision-submit'
+      try { response = await callUpstreamRemote(endpoint, { ...args, request: bridged }, rpcId) }
+      catch (error) { if (error && typeof error === 'object') error.receiptStage = receiptStage; throw error }
     }
   }
   if (method === 'subagent.list' && modernResponseNeedsLegacyFallback(response)) {
@@ -2104,14 +3099,16 @@ async function translateModernRpc(method, payload, rpcId) {
     const parent = await callUpstreamRemote('session/projections', { request: { sessionId: payload.parentSessionId } }, rpcId)
     if (modernResponseNeedsLegacyFallback(parent)) return legacyFallback('generated subagent catalog unavailable')
     if (!parent.body?.result?.ok) return parent.body || legacyEnvelope(rpcId, modernError('DSH subagent catalog read failed'))
+    if (parent.body.result.value?.kind === 'migration-required') return legacyEnvelope(rpcId, modernError('Open the source session in DSH to complete migration, then refresh.', 'session/migration-required', { sessionId: payload.parentSessionId }))
     const catalog = parent.body.result.value?.values?.subagentCatalog
     if (!Array.isArray(catalog)) return legacyEnvelope(rpcId, modernError('DSH did not expose a subagent catalog projection', 'subagent/projections-unavailable'))
     await refreshModernSessions()
     const entries = await Promise.all(catalog.map(async child => {
-      if (!['one-shot', 'continuable'].includes(child.mode)) return { kind: 'diagnostic', id: child.id, reason: 'unsupported' }
+      if (!['one-shot', 'continuable'].includes(child.mode)) return { kind: 'diagnostic', id: child.id, ...(child.label === undefined ? {} : { label: child.label }), reason: child.mode === 'external' ? 'external' : 'unsupported' }
       try {
         const read = await callUpstreamRemote('session/projections', { request: { sessionId: child.id } })
         if (!read.body?.result?.ok || !read.body.result.value) return { kind: 'diagnostic', id: child.id, reason: 'unavailable' }
+        if (read.body.result.value.kind === 'migration-required') return { kind: 'diagnostic', id: child.id, ...(child.label === undefined ? {} : { label: child.label }), reason: 'migration-required' }
         const values = read.body.result.value.values
         const identity = values?.subagent
         if (!identity || identity.mode !== child.mode) return { kind: 'diagnostic', id: child.id, reason: 'corrupt' }
@@ -2123,8 +3120,10 @@ async function translateModernRpc(method, payload, rpcId) {
     }))
     return legacyEnvelope(rpcId, { ok: true, value: { entries, parentAvailable: !!modernState.sessions.get(payload.parentSessionId)?.agentAvailable } })
   }
+  if (strictReceipt && ((response.status >= 500 && response.status !== 501) || (typeof response.body?.result?.ok !== 'boolean' && ![404,405,501].includes(response.status)))) throw Object.assign(new Error('upstream-uncertain'), { httpStatus: response.status, receiptCategory: response.status >= 500 ? 'upstream-http' : 'invalid-response', receiptStage })
   if (modernResponseNeedsLegacyFallback(response)) return legacyFallback(`generated RPC ${endpoint} unavailable`)
   if (!response.body?.result?.ok) {
+    if (migrationFailure(response)) return migrationReply()
     recordCompatibility('generated-rpc-error', { method, status: response.status, detail: remoteFailureKind(response) })
     return response.body || legacyEnvelope(rpcId, modernError(`DSH ${endpoint} returned no JSON response`))
   }
@@ -2195,6 +3194,13 @@ function broadcastCollectorFrame(kind, raw) {
       collectorClients[kind].delete(socket)
       continue
     }
+    // A slow phone must not retain an unbounded queue on the host. Reconnection
+    // restores the baseline/history; committed events are never selectively dropped.
+    if (socket.writableLength + frame.length > WS_CLIENT_BUFFER_MAX) {
+      collectorClients[kind].delete(socket)
+      socket.destroy()
+      continue
+    }
     try { socket.write(frame) } catch { try { socket.destroy() } catch {} }
   }
   state.clients = collectorClients[kind].size
@@ -2213,12 +3219,17 @@ function pushEvent(kind, full, raw = JSON.stringify(full)) {
   flushEventPollWaiters(kind)
 }
 
-function eventPollPayload(kind, since, waitSupported = false) {
+function eventPollPayload(kind, since, waitSupported = false, epoch = '') {
   const buf = eventBuffers[kind]
   const events = buf.filter(r => r.seq > since)
   const latestSeq = buf.length ? buf[buf.length - 1].seq : 0
   const truncated = buf.length > 0 && since < buf[0].seq - 1
-  return { ok: true, kind, since, latestSeq, truncated, waitSupported, events }
+  const reset = !!epoch && epoch !== EVENT_STREAM_EPOCH || latestSeq < since || truncated
+  const baseline = since === 0 || reset ? [...collectorReplay[kind].values()].map(raw => {
+    try { return JSON.parse(raw) } catch { return null }
+  }).filter(Boolean) : []
+  return { ok: true, kind, epoch: EVENT_STREAM_EPOCH, since, latestSeq, truncated, reset, waitSupported,
+    baseline, events: reset ? buf.slice() : events }
 }
 
 function sendEventPollResponse(waiter, payload) {
@@ -2233,13 +3244,13 @@ function sendEventPollResponse(waiter, payload) {
 function finishEventPollWaiter(waiter, send = true) {
   if (!eventPollWaiters[waiter.kind]?.delete(waiter)) return
   clearTimeout(waiter.timer)
-  if (send) sendEventPollResponse(waiter, eventPollPayload(waiter.kind, waiter.since, true))
+  if (send) sendEventPollResponse(waiter, eventPollPayload(waiter.kind, waiter.since, true, waiter.epoch))
 }
 
 function flushEventPollWaiters(kind) {
   for (const waiter of [...eventPollWaiters[kind]]) {
-    const payload = eventPollPayload(kind, waiter.since, true)
-    if (payload.events.length) finishEventPollWaiter(waiter, true)
+    const payload = eventPollPayload(kind, waiter.since, true, waiter.epoch)
+    if (payload.events.length || payload.reset) finishEventPollWaiter(waiter, true)
   }
 }
 
@@ -2308,8 +3319,9 @@ function serveEventPoll(req, res, url) {
   }
   const wait = Math.min(Math.floor(requestedWait), EVENT_POLL_WAIT_MAX)
   const waitSupported = wait > 0 && EVENT_POLL_WAIT_MAX > 0
-  const payload = eventPollPayload(kind, since, waitSupported)
-  if (payload.events.length || wait <= 0 || EVENT_POLL_WAIT_MAX <= 0) {
+  const epoch = String(url.searchParams.get('epoch') || '').slice(0, 80)
+  const payload = eventPollPayload(kind, since, waitSupported, epoch)
+  if (payload.events.length || payload.reset || payload.baseline.length || wait <= 0 || EVENT_POLL_WAIT_MAX <= 0) {
     cors(res)
     sendHttpBody(res, 200, {
       'content-type': 'application/json; charset=utf-8',
@@ -2317,13 +3329,13 @@ function serveEventPoll(req, res, url) {
     }, JSON.stringify(payload), true)
     return
   }
-  const waiter = { req, res, kind, since, timer: null }
+  const waiter = { req, res, kind, since, epoch, timer: null }
   eventPollWaiters[kind].add(waiter)
   waiter.timer = setTimeout(() => finishEventPollWaiter(waiter, true), wait)
   waiter.timer.unref?.()
   req.once('close', () => finishEventPollWaiter(waiter, false))
   // 事件可能刚好在首次检查和加入等待集合之间到达，加入后再检查一次避免漏唤醒。
-  if (eventPollPayload(kind, since, true).events.length) finishEventPollWaiter(waiter, true)
+  if (eventPollPayload(kind, since, true, epoch).events.length) finishEventPollWaiter(waiter, true)
 }
 
 /** 网关自带上游事件采集：mux/host 各一条 WS，断线自动重连。 */
@@ -2439,22 +3451,91 @@ function legacyPush(kind, payload, rpcId = crypto.randomUUID()) {
   pushEvent(kind, { rpcId, payload })
 }
 
-function openModernSessionStream(ws, sessionId) {
-  if (!sessionId || ws.readyState !== 1) return
-  // subagent 来源的会话在 DSH 侧只接受带 durable parent address 的 follow，
-  // 直接按 session 地址 open 会被拒（session/agent-busy），错误帧还会污染事件流；
-  // 这些会话的投影变化由 control/workspaces 基线推送覆盖，无需单独 follow。
+function requestModernSessionStream(sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 500) return
+  // Current clients refresh visible history every 15s. Keep bounded, expiring demand
+  // without changing their protocol or opening history just because it was listed.
+  const interests = modernState.sessionInterests
+  interests.delete(sessionId)
+  interests.set(sessionId, Date.now() + 90000)
+  while (interests.size > 8) interests.delete(interests.keys().next().value)
+  eventCollectors.mux?.syncSessions?.()
+}
+
+function modernSessionStreamAvailable(sessionId) {
   const summary = modernState.sessions.get(sessionId)
-  if (summary?.origin === 'subagent') return
-  const streamId = 'session:' + sessionId
-  ws.send(JSON.stringify({
-    type: 'open', streamId, endpoint: 'session/follow',
-    payload: { args: { request: { address: { kind: 'session', sessionId }, assistantStream: true } } },
-  }))
-  ws.send(JSON.stringify({
-    type: 'open', streamId: 'jobs:' + sessionId, endpoint: 'job/list',
-    payload: { args: { request: { sessionId } } },
-  }))
+  // DSH follow promotes a cold ordinary session to a writable Agent. Only observe
+  // sessions already activated by the host/user; history itself stays a cold read.
+  return !!summary && (summary.agentAvailable === true || summary.running === true)
+    && summary.origin !== 'subagent' && summary.formatStatus !== 'migration-required'
+    && (modernState.sessionFailures?.get(sessionId)?.until || 0) <= Date.now()
+}
+
+function openModernSessionStream(ws, sessionId, streams = { session: 'session:' + sessionId, jobs: 'jobs:' + sessionId }) {
+  if (ws.readyState !== 1 || !modernSessionStreamAvailable(sessionId)) return null
+  try {
+    ws.send(JSON.stringify({
+      type: 'open', streamId: streams.session, endpoint: 'session/follow',
+      payload: { args: { request: { address: { kind: 'session', sessionId }, assistantStream: true } } },
+    }))
+    ws.send(JSON.stringify({
+      type: 'open', streamId: streams.jobs, endpoint: 'job/list',
+      payload: { args: { request: { sessionId } } },
+    }))
+    return streams
+  } catch {
+    // A carrier closing during the history response must not fail the cold read.
+    for (const streamId of Object.values(streams)) try { ws.send(JSON.stringify({ type: 'cancel', streamId })) } catch {}
+    return null
+  }
+}
+
+function forgetModernSessionStream(sessionId) {
+  modernState.followedSessions.delete(sessionId)
+  modernState.sessionCursors.delete(sessionId)
+  modernState.assistantStreams.delete(sessionId)
+  for (const prefix of ['session:', 'reasoning:', 'jobs:']) collectorReplay.mux.delete(prefix + sessionId)
+}
+
+function syncModernSessionStreams(ws, opened) {
+  const interests = modernState.sessionInterests, now = Date.now()
+  for (const [sessionId, until] of interests) if (until <= now) interests.delete(sessionId)
+  for (const [sessionId, streams] of opened) {
+    if (interests.has(sessionId) && modernSessionStreamAvailable(sessionId)) continue
+    if (ws?.readyState === 1) for (const streamId of Object.values(streams)) {
+      try { ws.send(JSON.stringify({ type: 'cancel', streamId })) } catch {}
+    }
+    opened.delete(sessionId)
+    forgetModernSessionStream(sessionId)
+  }
+  if (ws?.readyState !== 1) return
+  for (const sessionId of interests.keys()) {
+    if (opened.has(sessionId) || !modernSessionStreamAvailable(sessionId)) continue
+    // Cancellation completes asynchronously at DSH. A fresh stream id allows a
+    // quick revisit without colliding with a still-closing invocation or its frames.
+    const key = crypto.randomUUID()
+    const streams = openModernSessionStream(ws, sessionId, { session: 'session:' + key, jobs: 'jobs:' + key })
+    if (streams) { opened.set(sessionId, streams); modernState.followedSessions.add(sessionId) }
+  }
+}
+
+function handleModernStreamFailure(ws, frame, observedSessionId = '', streams) {
+  const text = String(frame.error?.message || '')
+  const streamId = String(frame.streamId || '')
+  const sessionId = observedSessionId || (streamId.startsWith('session:') ? streamId.slice(8) : streamId.startsWith('jobs:') ? streamId.slice(5)
+    : text.match(/failed to observe session ["']([^"']+)["']/i)?.[1])
+  if (!sessionId || !modernState.sessions.has(sessionId)) return false
+  const migration = /cannot safely transform unclassified message source|migration-required|source v0 artifact remains unchanged/i.test(text + ' ' + frame.error?.code)
+  const error = { code: migration ? 'session/migration-required' : 'session/stream-unavailable', message: migration
+    ? 'This source session requires migration in DSH. Other sessions remain available.' : 'Live updates for this session are unavailable. Retry this session after checking DSH.' }
+  modernState.sessionFailures ||= new Map()
+  if (modernState.sessionFailures.size >= 200) modernState.sessionFailures.delete(modernState.sessionFailures.keys().next().value)
+  modernState.sessionFailures.set(sessionId, { until: Date.now() + 60000, error })
+  for (const id of new Set(streams ? Object.values(streams) : ['session:' + sessionId, 'jobs:' + sessionId, streamId])) if (id) {
+    try { ws.send(JSON.stringify({ type: 'cancel', streamId: id })) } catch {}
+  }
+  legacyPush('mux', { type: 'session/stream-error', sessionId, error })
+  return true
 }
 
 function applyModernProjection(sessionId, key, value, seq) {
@@ -2578,6 +3659,7 @@ function applyModernAssistantStream(sessionId, value, baseline = false) {
 
 function applyModernSessionFrame(sessionId, value) {
   if (value?.type === 'snapshot') {
+    modernState.sessionFailures?.delete(sessionId)
     if (value.assistantStream) applyModernAssistantStream(sessionId, value.assistantStream, true)
     modernState.sessionCursors.set(sessionId, value.cursor)
     legacyPush('mux', { type: 'session/subscribed', sessionId, lastSeq: value.cursor })
@@ -2618,6 +3700,10 @@ function applyModernRemoteEvent(ws, value) {
   if (value?.type === 'ready') {
     modernState.eventClientId = value.clientId || ''
     modernState.home = value.host?.home || modernState.home
+    const host = value.host || {}
+    modernState.hostInfo = { version: typeof host.version === 'string' ? host.version.slice(0, 100) : null,
+      cwd: typeof host.cwd === 'string' ? host.cwd.slice(0, 2000) : null,
+      attachedSessions: Number.isSafeInteger(host.attachedSessions) && host.attachedSessions >= 0 ? host.attachedSessions : null }
     return
   }
   if (value?.type === 'cancel') {
@@ -2645,7 +3731,7 @@ function applyModernRemoteEvent(ws, value) {
     const summary = args[0]
     if (summary?.sessionId) {
       modernState.sessions.set(summary.sessionId, summary)
-      openModernSessionStream(ws, summary.sessionId)
+      eventCollectors.mux?.syncSessions?.()
       legacyPush('host', {
         type: 'host/session-added', sessionId: summary.sessionId, blank: !!summary.blank,
         ...(summary.parentSessionId === undefined ? {} : { parentSessionId: summary.parentSessionId }),
@@ -2655,16 +3741,19 @@ function applyModernRemoteEvent(ws, value) {
     }
   } else if (value.event === 'api-session/removed') {
     modernState.sessions.delete(args[0])
+    modernState.sessionInterests.delete(args[0])
     modernState.sessionCursors.delete(args[0])
     modernState.assistantStreams.delete(args[0])
     collectorReplay.mux.delete(`reasoning:${args[0]}`)
     collectorReplay.mux.delete(`session:${args[0]}`)
     collectorReplay.mux.delete(`queue:${args[0]}`)
     collectorReplay.mux.delete(`jobs:${args[0]}`)
-    try { ws.send(JSON.stringify({ type: 'cancel', streamId: 'session:' + args[0] })) } catch {}
-    try { ws.send(JSON.stringify({ type: 'cancel', streamId: 'jobs:' + args[0] })) } catch {}
+    eventCollectors.mux?.syncSessions?.()
     legacyPush('host', { type: 'host/session-removed', sessionId: args[0] })
   } else if (value.event === 'api-session/status') {
+    const summary = modernState.sessions.get(args[0])
+    if (summary) modernState.sessions.set(args[0], { ...summary, running: !!args[1] })
+    eventCollectors.mux?.syncSessions?.()
     legacyPush('host', { type: 'host/session-status', sessionId: args[0], running: !!args[1] })
   } else if (value.event === 'api-session/activity') {
     const sessionId = String(args[0] || '')
@@ -2686,6 +3775,10 @@ function startModernEventCollector() {
   let retryTimer = null
   let connectTimer = null
   let attempt = 0
+  const sessionStreams = new Map()
+  const syncSessions = () => syncModernSessionStreams(ws, sessionStreams)
+  const interestTimer = setInterval(syncSessions, 15000)
+  interestTimer.unref?.()
   const scheme = UPSTREAM.protocol === 'https:' ? 'wss' : 'ws'
   const url = `${scheme}://${UPSTREAM_AUTHORITY}/api/remote.mux`
   const setConnected = (connected, error = '') => {
@@ -2706,6 +3799,8 @@ function startModernEventCollector() {
   }
   const connect = () => {
     if (stopped) return
+    for (const sessionId of sessionStreams.keys()) forgetModernSessionStream(sessionId)
+    sessionStreams.clear()
     let current
     try {
       const headers = dshUpstreamHeaders()
@@ -2720,7 +3815,10 @@ function startModernEventCollector() {
     const finish = (code = 0, reason = '', error = '') => {
       if (finished) return
       finished = true
+      if (ws !== current) return
       clearTimeout(connectTimer)
+      for (const sessionId of sessionStreams.keys()) forgetModernSessionStream(sessionId)
+      sessionStreams.clear()
       modernState.eventClientId = ''
       setConnected(false, error)
       for (const state of Object.values(eventCollectorState)) {
@@ -2744,16 +3842,23 @@ function startModernEventCollector() {
       current.send(JSON.stringify({ type: 'open', streamId: 'events', endpoint: '$events', payload: { args: {} } }))
       current.send(JSON.stringify({ type: 'open', streamId: 'control', endpoint: 'session/control', payload: { args: {} } }))
       current.send(JSON.stringify({ type: 'open', streamId: 'workspaces', endpoint: 'workspace/follow', payload: { args: {} } }))
-      for (const sessionId of modernState.sessions.keys()) openModernSessionStream(current, sessionId)
+      syncSessions()
     }
     current.onmessage = ev => {
+      if (finished || stopped || ws !== current) return
       try {
         const data = typeof ev.data === 'string' ? ev.data : Buffer.isBuffer(ev.data) ? ev.data.toString() : String(ev.data)
         const frame = JSON.parse(data)
+        const observed = [...sessionStreams].find(([, streams]) => streams.session === frame.streamId || streams.jobs === frame.streamId)
+        if ((frame.streamId?.startsWith('session:') || frame.streamId?.startsWith('jobs:')) && !observed) return
         if (frame.type === 'error') {
           // Old generated-RPC Hosts may have no job namespace. This optional
           // roster must not degrade the working session and approval streams.
           if (frame.streamId?.startsWith('jobs:') && ['gateway/definition-unavailable', 'gateway/invocation-unavailable', 'gateway/service-unavailable', 'gateway/method-unavailable', 'method-unavailable', 'not-found'].includes(frame.error?.code)) return
+          if (handleModernStreamFailure(current, frame, observed?.[0], observed?.[1])) {
+            if (observed) { sessionStreams.delete(observed[0]); forgetModernSessionStream(observed[0]) }
+            return
+          }
           const message = frame.error?.message || 'modern stream error'
           for (const state of Object.values(eventCollectorState)) state.lastError = message
           legacyPush('mux', { type: 'stream/error', error: frame.error || { message } })
@@ -2763,8 +3868,8 @@ function startModernEventCollector() {
         if (frame.streamId === 'events') applyModernRemoteEvent(current, frame.value)
         else if (frame.streamId === 'control') applyModernControlFrame(frame.value)
         else if (frame.streamId === 'workspaces') applyModernWorkspaceFrame(frame.value)
-        else if (frame.streamId.startsWith('jobs:')) applyModernJobFrame(frame.streamId.slice(5), frame.value)
-        else if (frame.streamId.startsWith('session:')) applyModernSessionFrame(frame.streamId.slice(8), frame.value)
+        else if (frame.streamId.startsWith('jobs:')) applyModernJobFrame(observed[0], frame.value)
+        else if (frame.streamId.startsWith('session:')) applyModernSessionFrame(observed[0], frame.value)
       } catch {}
     }
     current.onclose = ev => finish(ev?.code, ev?.reason)
@@ -2776,6 +3881,7 @@ function startModernEventCollector() {
   connect()
   return {
     kind: 'modern',
+    syncSessions,
     reconnectNow() {
       if (stopped || ws?.readyState === 0 || ws?.readyState === 1) return
       clearTimeout(retryTimer)
@@ -2787,6 +3893,9 @@ function startModernEventCollector() {
       stopped = true
       clearTimeout(retryTimer)
       clearTimeout(connectTimer)
+      clearInterval(interestTimer)
+      for (const sessionId of sessionStreams.keys()) forgetModernSessionStream(sessionId)
+      sessionStreams.clear()
       try { ws?.close() } catch {}
     },
   }
@@ -2870,12 +3979,11 @@ function serveStats(req, res, url) {
   }
 
   if (pathname === '/stats/ingest' && req.method === 'POST') {
-    let body = ''
-    req.on('data', c => { body += c; if (body.length > 256 * 1024) req.destroy() })
-    req.on('end', () => {
+    withRequestBody(req, res, 256 * 1024, body => {
       let payload
       try {
         payload = JSON.parse(body || '{}')
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('invalid object')
       } catch {
         res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
         res.end(JSON.stringify({ error: 'invalid json' }))
@@ -3025,29 +4133,114 @@ async function serveAnnouncements(req, res) {
   else res.end(snapshot.raw)
 }
 
-function findPollVote(items, announcementId, pollId, optionId) {
-  const announcement = items.find(item => String(item?.id || '').trim() === announcementId)
-  const poll = announcement?.poll
-  if (!poll || String(poll.id || '').trim() !== pollId || !Array.isArray(poll.options)) return { error: 'poll not found' }
-  const option = poll.options.find(item => String(item?.id || '').trim() === optionId)
-  if (!option) return { error: 'poll option not found' }
-  const optionLabel = String(option.label || '').trim().slice(0, 200)
-  if (!optionLabel) return { error: 'poll option invalid' }
-  return { announcementId, pollId, optionId, optionLabel }
+// BEGIN EMBEDDED ANNOUNCEMENT FORMS
+function createAnnouncementForms() {
+  const string = (value, max) => typeof value === 'string' && value.trim().length <= max ? value.trim() : ''
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
+  function normalize(value, announcementId) {
+    if (!value || typeof value !== 'object') return null
+    const id = string(value.id || announcementId, 120)
+    const legacy = !Array.isArray(value.questions) && !value.type || value.legacy === true
+    const rows = Array.isArray(value.questions) ? value.questions : [{ ...value, id: 'answer' }]
+    if (!id || !rows.length || rows.length > 8) return null
+    const ids = new Set(), questions = []
+    for (const row of rows) {
+      const questionId = string(row?.id, 120), question = string(row?.question || row?.label, 300), type = row?.type || 'single'
+      if (!questionId || ids.has(questionId) || !question || !['single','multiple','text'].includes(type)) return null
+      ids.add(questionId)
+      const required = row.required !== false, options = [], seen = new Set()
+      if (type !== 'text') {
+        if (!Array.isArray(row.options) || row.options.length < 2 || row.options.length > 12) return null
+        for (const option of row.options) {
+          const optionId = string(option?.id, 120), label = string(option?.label, 200)
+          if (!optionId || !label || seen.has(optionId)) return null
+          seen.add(optionId); options.push({ id: optionId, label, description: string(option.description || '', 500) })
+        }
+      }
+      const min = type === 'text' ? (required ? 1 : 0) : row.minSelections ?? row.min ?? (required ? 1 : 0)
+      const max = type === 'text' ? row.maxLength ?? row.max ?? 600 : type === 'single' ? 1 : row.maxSelections ?? row.max ?? options.length
+      if (!Number.isInteger(min) || !Number.isInteger(max) || min < 0 || max < Math.max(1, min) || max > (type === 'text' ? 1200 : options.length)) return null
+      questions.push({ id: questionId, question, type, required, options, min, max, placeholder: string(row.placeholder || '', 200) })
+    }
+    return { id, legacy: !!legacy, question: string(value.question || value.title, 300) || questions[0].question,
+      options: questions.length === 1 ? questions[0].options : [], questions }
+  }
+  function validate(poll, payload) {
+    if (!poll) return { error: 'poll not found' }
+    const rows = poll.legacy && typeof payload.optionId === 'string' ? [{ questionId: poll.questions[0].id, optionIds: [payload.optionId] }] : payload.answers
+    if (!Array.isArray(rows) || rows.length > poll.questions.length) return { error: 'invalid answers' }
+    const byId = new Map()
+    for (const row of rows) {
+      if (!row || typeof row.questionId !== 'string' || byId.has(row.questionId) || !poll.questions.some(q => q.id === row.questionId)) return { error: 'invalid question' }
+      byId.set(row.questionId, row)
+    }
+    const answers = []
+    for (const q of poll.questions) {
+      const row = byId.get(q.id)
+      if (q.type === 'text') {
+        const value = row?.text ?? ''
+        if (typeof value !== 'string' || value.trim().length < q.min || value.trim().length > q.max || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(value)) return { error: 'invalid text', questionId: q.id }
+        if (value.trim()) answers.push({ questionId: q.id, text: value.trim() })
+      } else {
+        const values = row?.optionIds ?? []
+        if (!Array.isArray(values) || values.length < q.min || values.length > q.max || new Set(values).size !== values.length) return { error: 'invalid selection count', questionId: q.id }
+        if (values.some(id => typeof id !== 'string' || !q.options.some(option => option.id === id))) return { error: 'poll option not found', questionId: q.id }
+        if (values.length) answers.push({ questionId: q.id, optionIds: q.options.filter(option => values.includes(option.id)).map(option => option.id) })
+      }
+    }
+    if (!answers.length) return { error: 'answer required' }
+    return poll.legacy ? { optionId: answers[0].optionIds[0] } : { answers }
+  }
+  function encode(announcementId, pollId, answer) {
+    const message = 'POLL ' + JSON.stringify({ announcementId, pollId, ...answer })
+    return message.length <= 2000 ? message : null
+  }
+  function render(poll, answers = [], disabled = false, english = false) {
+    return poll.questions.map((q, index) => {
+      const answer = answers.find(row => row.questionId === q.id), off = disabled ? ' disabled' : ''
+      const label = q.question + (q.required ? ' *' : '')
+      const body = q.type === 'text'
+        ? `<textarea aria-label="${esc(label)}" id="announcement-field-${index}" maxlength="${q.max}" rows="2" placeholder="${esc(q.placeholder)}"${q.required ? ' required' : ''}${off}>${esc(answer?.text || '')}</textarea>`
+        : q.options.map(option => `<label class="announcement-poll-option"><input type="${q.type === 'multiple' ? 'checkbox' : 'radio'}" name="announcement-q-${index}" value="${esc(option.id)}"${answer?.optionIds?.includes(option.id) ? ' checked' : ''}${off}><span><strong>${esc(option.label)}</strong>${option.description ? `<small>${esc(option.description)}</small>` : ''}</span></label>`).join('')
+      const hint = q.type === 'multiple' ? (english ? `Choose ${q.min}–${q.max}` : `选择 ${q.min}–${q.max} 项`) : q.type === 'text' ? (english ? `Up to ${q.max} characters` : `最多 ${q.max} 字`) : ''
+      return `<fieldset class="announcement-form-field" data-form-question="${esc(q.id)}"><legend>${esc(label)}</legend>${hint ? `<p class="announcement-form-hint">${esc(hint)}</p>` : ''}${body}</fieldset>`
+    }).join('')
+  }
+  function read(panel, poll) {
+    const fields = [...panel.querySelectorAll('[data-form-question]')]
+    return poll.questions.map(q => {
+      const field = fields.find(el => el.dataset.formQuestion === q.id)
+      return q.type === 'text' ? { questionId: q.id, text: field?.querySelector('textarea')?.value || '' }
+        : { questionId: q.id, optionIds: [...(field?.querySelectorAll('input:checked') || [])].map(el => el.value) }
+    })
+  }
+  return { normalize, validate, encode, render, read }
+}
+const announcementForms = createAnnouncementForms()
+// END EMBEDDED ANNOUNCEMENT FORMS
+
+function findPollVote(items, announcementId, pollId, payload) {
+  const item = items.find(item => String(item?.id || '').trim() === announcementId)
+  if (!item?.poll || String(item.poll.id || '').trim() !== pollId) return { error: 'poll not found' }
+  const starts = Date.parse(item.publishedAt || item.startsAt || ''), expires = Date.parse(item.expiresAt || '')
+  if (item.poll.closed === true || Number.isFinite(starts) && starts > Date.now() || Number.isFinite(expires) && expires <= Date.now()) return { error: 'poll closed' }
+  const poll = announcementForms.normalize(item.poll, announcementId)
+  const answer = announcementForms.validate(poll, payload)
+  if (answer.error) return answer
+  return { announcementId, pollId, ...answer, ...(poll.legacy ? { optionLabel: poll.options.find(option => option.id === answer.optionId).label } : {}) }
 }
 
 async function validatePollVote(payload) {
   const announcementId = String(payload.announcementId || '').trim()
   const pollId = String(payload.pollId || '').trim()
-  const optionId = String(payload.optionId || '').trim()
-  if (!announcementId || !pollId || !optionId) return { error: 'poll fields required' }
-  if (announcementId.length > 120 || pollId.length > 120 || optionId.length > 120) return { error: 'poll fields too long' }
+  if (!announcementId || !pollId) return { error: 'poll fields required' }
+  if (announcementId.length > 120 || pollId.length > 120) return { error: 'poll fields too long' }
   let snapshot = await loadCentralAnnouncements()
-  let result = findPollVote(snapshot.items, announcementId, pollId, optionId)
+  let result = findPollVote(snapshot.items, announcementId, pollId, payload)
   // 中央公告刚发布、网关缓存尚未到期时，投票请求触发一次强制刷新，避免出现公告可见但选项暂不可投。
   if (result.error && ANNOUNCEMENTS_URL) {
     snapshot = await loadCentralAnnouncements(true)
-    result = findPollVote(snapshot.items, announcementId, pollId, optionId)
+    result = findPollVote(snapshot.items, announcementId, pollId, payload)
   }
   return result
 }
@@ -3119,12 +4312,11 @@ function serveFeedback(req, res, url) {
   }
   touchDevice(req)
 
-  let body = ''
-  req.on('data', c => { body += c; if (body.length > 16 * 1024) req.destroy() })
-  req.on('end', async () => {
+  withRequestBody(req, res, 16 * 1024, async body => {
     let payload
     try {
       payload = JSON.parse(body || '{}')
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('invalid object')
     } catch {
       res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({ error: 'invalid json' }))
@@ -3149,7 +4341,14 @@ function serveFeedback(req, res, url) {
     }
     // 公网收集器的旧版只保留 type/message 等通用字段。同时发送结构化
     // 字段和稳定的 message 编码，旧收集器也能用 scripts/summarize-polls.mjs 汇总。
-    if (pollVote) message = 'POLL ' + JSON.stringify({ announcementId: pollVote.announcementId, pollId: pollVote.pollId, optionId: pollVote.optionId })
+    if (pollVote) {
+      message = announcementForms.encode(pollVote.announcementId, pollVote.pollId, pollVote.answers ? { answers: pollVote.answers } : { optionId: pollVote.optionId })
+      if (message === null) {
+        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ error: 'answers too long', max: 2000 }))
+        return
+      }
+    }
     if (!message) {
       res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({ error: 'message required' }))
@@ -3222,13 +4421,14 @@ function serveStatic(req, res, url) {
   let pathname
   try {
     pathname = decodeURIComponent(url.pathname)
+    if (pathname.includes('\0')) throw new Error('invalid path')
   } catch {
     res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' })
     res.end('400 Bad Request')
     return
   }
   if (pathname === '/') pathname = '/index.html'
-  if (pathname === '/admin') pathname = '/admin.html'
+  if (pathname === '/admin' || pathname === '/admin/') pathname = '/admin.html'
   if (pathname === '/announcements.json') {
     void serveAnnouncements(req, res)
     return
@@ -3307,6 +4507,20 @@ function upstreamReachable(cb) {
 
 async function serveAdminApi(req, res, url) {
   const sub = url.pathname.slice('/admin/api'.length) || '/'
+  if (sub === '/autostart') {
+    const reply = (status, value) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(value)) }
+    if (!adminAuthorized(req, url)) return reply(401, { error: 'unauthorized' })
+    if (!['GET', 'POST'].includes(req.method)) { res.setHeader('allow', 'GET, POST'); return reply(405, { error: 'method-not-allowed' }) }
+    try {
+      if (req.method === 'GET') return reply(200, { ok: true, ...await loginAutostart.status() })
+      const body = await readBody(req, 1024)
+      let input
+      try { input = JSON.parse(body) } catch { return reply(400, { error: 'bad-request' }) }
+      if (!input || typeof input.enabled !== 'boolean' || Object.keys(input).some(key => key !== 'enabled')) return reply(400, { error: 'bad-request' })
+      return reply(200, { ok: true, ...await loginAutostart.change(input.enabled) })
+    } catch (error) { return reply(error.status || 500, { ok: false, error: error.code || 'STARTUP_FAILED', detail: error.message }) }
+  }
+  if (sub === '/relay') return serveRelaySettings(req, res, url)
   if (sub === '/dsh') return serveDshControl(req, res, url)
   if (sub === '/state' && req.method === 'GET') {
     if (!adminAuthorized(req, url)) {
@@ -3366,12 +4580,7 @@ async function serveAdminApi(req, res, url) {
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
-    let body = ''
-    req.on('data', chunk => {
-      body += chunk
-      if (body.length > 8192) req.destroy()
-    })
-    req.on('end', () => {
+    withRequestBody(req, res, 8192, body => {
       let payload = {}
       try { payload = JSON.parse(body || '{}') } catch {
         res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
@@ -3381,6 +4590,9 @@ async function serveAdminApi(req, res, url) {
       const send = (status, value) => {
         res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(JSON.stringify(value))
+      }
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload) || (payload.note !== undefined && typeof payload.note !== 'string')) {
+        return send(400, { error: 'bad-request' })
       }
       if (sub === '/device-keys/mode') {
         if (typeof payload.enabled !== 'boolean') return send(400, { error: 'bad-request', detail: 'enabled 必须是布尔值' })
@@ -3490,9 +4702,7 @@ async function serveAdminApi(req, res, url) {
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
-    let body = ''
-    req.on('data', c => { body += c; if (body.length > 4096) req.destroy() })
-    req.on('end', () => {
+    withRequestBody(req, res, 4096, body => {
       try {
         const { ip, name } = JSON.parse(body || '{}')
         if (typeof ip !== 'string' || typeof name !== 'string') throw new Error('bad')
@@ -3515,9 +4725,7 @@ async function serveAdminApi(req, res, url) {
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
-    let body = ''
-    req.on('data', c => { body += c; if (body.length > 1024) req.destroy() })
-    req.on('end', () => {
+    withRequestBody(req, res, 1024, body => {
       try {
         const ip = JSON.parse(body || '{}').ip
         const n = typeof ip === 'string' ? kickDevice(ip) : 0
@@ -3532,6 +4740,29 @@ async function serveAdminApi(req, res, url) {
   }
   res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify({ error: 'not-found' }))
+}
+
+async function serveRelaySettings(req, res, url) {
+  cors(res)
+  const reply = (status, value) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(value)) }
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end() }
+  if (!['GET', 'POST'].includes(req.method)) { res.setHeader('allow', 'GET, POST, OPTIONS'); return reply(405, { error: 'METHOD_NOT_ALLOWED' }) }
+  const canManage = adminAuthorized(req, url)
+  if (!canManage && !authorized(req, url)) return reply(401, { error: 'unauthorized' })
+  if (req.method === 'GET') return reply(200, { ...relayHost.status(), canManage })
+  if (!canManage) return reply(403, { error: 'RELAY_ADMIN_REQUIRED' })
+  try {
+    const chunks = []; let size = 0
+    for await (const chunk of req) { size += chunk.length; if (size > 4096) return reply(413, { error: 'BODY_TOO_LARGE' }); chunks.push(chunk) }
+    let value
+    try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { return reply(400, { error: 'INVALID_JSON' }) }
+    if (!value || Object.keys(value).some(key => !['action', 'key'].includes(key))) return reply(400, { error: 'INVALID_RELAY_ACTION' })
+    const result = await relayHost.change(value.action, value.key)
+    return reply(200, { ...result, canManage: true })
+  } catch (error) {
+    const known = new Set(['INVALID_AUTHORIZATION', 'HOST_ALREADY_BOUND', 'REGISTRY_BUSY', 'TRY_LATER', 'ENROLLMENT_CONNECTION_FAILED', 'ENROLLMENT_REJECTED', 'RELAY_OPERATION_BUSY', 'HOST_NOT_CONFIGURED', 'INVALID_RELAY_ACTION', 'RELAY_SERVER_MISMATCH', 'INVALID_SERVER_RESPONSE', 'HOST_ALREADY_CONFIGURED', 'LEGACY_RELAY_UNAVAILABLE'])
+    return reply(error.status || 503, { error: known.has(error.code) ? error.code : 'RELAY_OPERATION_FAILED' })
+  }
 }
 
 // ---------- /fs 文件传输: 实现 ----------
@@ -3553,8 +4784,10 @@ function fsAuthorized(req, url, res) {
 }
 
 function fsInsideRootFor(pathApi, abs, root, caseInsensitive = false) {
-  let candidate = pathApi.resolve(String(abs || ''))
-  let boundary = pathApi.resolve(String(root || ''))
+  const normal = value => pathApi.sep === '\\'
+    ? String(value || '').replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '') : String(value || '')
+  let candidate = pathApi.resolve(normal(abs))
+  let boundary = pathApi.resolve(normal(root))
   if (caseInsensitive) {
     candidate = candidate.toLowerCase()
     boundary = boundary.toLowerCase()
@@ -3609,7 +4842,7 @@ async function loadFsWorkspaceRoots(force = false) {
       }
       const items = Array.isArray(value?.items) ? value.items : []
       const roots = [...new Set(items.map(fsWorkspacePath).filter(Boolean))]
-      const reals = roots.map(root => { try { return fs.realpathSync(root) } catch { return null } }).filter(Boolean)
+      const reals = roots.map(root => { try { return (fs.realpathSync.native || fs.realpathSync)(root) } catch { return null } }).filter(Boolean)
       fsWorkspaceRootsCache = { roots, reals, fetchedAt: Date.now() }
     } catch {
       // DSH 重启期间保留上次成功的工作区根；缓存为空时仍仅允许显式 FS_ROOTS。
@@ -3645,7 +4878,7 @@ async function fsResolve(input) {
 function fsRealChecked(abs) {
   let real
   try {
-    real = fs.realpathSync(abs)
+    real = (fs.realpathSync.native || fs.realpathSync)(abs)
   } catch (err) {
     return { error: err.code === 'ENOENT' ? 'not-found' : 'permission-denied' }
   }
@@ -3721,14 +4954,16 @@ async function fsList(req, res, url) {
     try {
       // 符号链接指向允许根之外时直接不展示, 点进去/下载也必然被 realpath 复核拒绝
       if (d.isSymbolicLink()) {
-        const real = fs.realpathSync(full)
+        const real = (fs.realpathSync.native || fs.realpathSync)(full)
         if (!fsInsideReal(real) || fsProtectedPath(real)) continue
       }
       const info = fs.statSync(full)
       if (!info.isFile() && !info.isDirectory()) continue
       entries.push({
         name: d.name,
-        path: full,
+        // Keep entry addresses in the same namespace as the requested directory.
+        // Native realpath may expand Windows short names or change their casing.
+        path: path.join(resolved.abs, d.name),
         type: info.isDirectory() ? 'dir' : 'file',
         size: info.isDirectory() ? 0 : info.size,
         mtimeMs: Math.round(info.mtimeMs)
@@ -3854,6 +5089,7 @@ function fsValidName(name) {
   if (!name || name === '.' || name === '..') return false
   if (name.includes('/') || name.includes('\\') || name.includes('\0')) return false
   if (path.basename(name) !== name) return false
+  if (Buffer.byteLength(name, 'utf8') > 255 || name.length > 255) return false
   return true
 }
 
@@ -3948,7 +5184,9 @@ function fsOpenUploadTarget(res, url, dirLex, dirReal, name) {
     fsJson(res, 409, { error: 'conflict', detail: '文件已存在, 追加 overwrite=1 可覆盖' })
     return null
   }
-  const tmp = path.join(dirReal, `.${name}.dsh-remote-part-${process.pid}-${crypto.randomBytes(4).toString('hex')}`)
+  let temporaryName = `.${name}.dsh-remote-part-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
+  if (Buffer.byteLength(temporaryName) > 255) temporaryName = `.dsh-remote-part-${crypto.randomBytes(16).toString('hex')}`
+  const tmp = path.join(dirReal, temporaryName)
   let stream
   try {
     stream = fs.createWriteStream(tmp, { flags: 'wx', mode: 0o600 })
@@ -4043,24 +5281,29 @@ function fsUploadRaw(req, res, url, dirLex, dirReal) {
 /** 零依赖流式 multipart 解析: 只取第一个文件部分, 2GB 也不会整块进内存。 */
 function fsUploadMultipart(req, res, url, dirLex, dirReal, boundary) {
   const queryName = url.searchParams.get('name') || ''
+  if (!boundary || boundary.length > 70 || /[^\x20-\x7e]/.test(boundary)) return fsJson(res, 400, { error: 'bad-multipart' })
   const marker = Buffer.from('\r\n--' + boundary)
+  const first = Buffer.from('--' + boundary + '\r\n')
   let head = Buffer.alloc(0)
   let tail = Buffer.alloc(0)
-  let state = 'headers' // headers -> data -> done
+  let state = 'headers' // headers -> data -> remainder/closed -> done
   let pipe = null
 
   const fail = (status, msg) => {
+    if (state === 'failed' || state === 'done') return
+    state = 'failed'
     if (pipe) pipe.abort(status, msg)
     else if (!res.headersSent) fsJson(res, status, { error: msg })
   }
 
-  const process = (buf) => {
-    if (state === 'done') return
+  const process = (buf, final = false) => {
+    if (['closed', 'failed', 'done'].includes(state)) return
     if (state === 'headers') {
       head = Buffer.concat([head, buf])
       if (head.length > 64 * 1024) return fail(400, 'multipart-headers-too-large')
       const idx = head.indexOf('\r\n\r\n')
       if (idx === -1) return
+      if (!head.subarray(0, first.length).equals(first)) return fail(400, 'bad-multipart')
       const headerText = head.slice(0, idx).toString('utf8')
       let partName = queryName
       if (!partName) {
@@ -4076,29 +5319,49 @@ function fsUploadMultipart(req, res, url, dirLex, dirReal, boundary) {
       if (rest.length) process(rest)
       return
     }
-    // data: 滑动窗口找 \r\n--boundary, 未命中时保留尾部防跨 chunk 边界
+    // A boundary prefix inside file data is not a delimiter unless its suffix is valid.
     buf = Buffer.concat([tail, buf])
-    const idx = buf.indexOf(marker)
-    if (idx === -1) {
-      const keep = Math.min(buf.length, marker.length - 1)
-      if (buf.length > keep) pipe.write(buf.slice(0, buf.length - keep))
-      tail = buf.slice(buf.length - keep)
-      return
+    let from = 0
+    while (true) {
+      const idx = buf.indexOf(marker, from)
+      if (idx < 0) break
+      const suffix = idx + marker.length
+      if (buf.length < suffix + 2) {
+        if (state === 'data' && idx) pipe.write(buf.subarray(0, idx))
+        tail = buf.subarray(idx); return
+      }
+      const ending = buf.subarray(suffix, suffix + 2).toString('ascii')
+      if (ending === '--') {
+        const after = suffix + 2
+        if (!final && buf.length < after + 2) {
+          if (state === 'data' && idx) pipe.write(buf.subarray(0, idx))
+          tail = buf.subarray(idx); return
+        }
+        if (buf.length === after || buf.subarray(after, after + 2).toString('ascii') === '\r\n') {
+          if (state === 'data' && idx) pipe.write(buf.subarray(0, idx))
+          tail = Buffer.alloc(0); state = 'closed'; return
+        }
+      } else if (ending === '\r\n') {
+        if (state === 'data' && idx) pipe.write(buf.subarray(0, idx))
+        state = 'remainder'
+        buf = buf.subarray(suffix + 2); from = 0; continue
+      }
+      from = idx + 1
     }
-    if (idx > 0) pipe.write(buf.slice(0, idx))
-    state = 'done'
-    pipe.end()
+    const keep = Math.min(buf.length, marker.length + 3)
+    if (state === 'data' && buf.length > keep) pipe.write(buf.subarray(0, buf.length - keep))
+    tail = buf.subarray(buf.length - keep)
   }
 
   req.on('aborted', () => { if (pipe) pipe.abort(400, 'client-aborted') })
   req.on('error', () => { if (pipe) pipe.abort(400, 'client-aborted') })
   req.on('data', (chunk) => process(chunk))
   req.on('end', () => {
+    if (state === 'failed' || state === 'done') return
     if (state === 'headers') return fail(400, 'no-file-part')
-    if (state === 'data' && pipe) {
-      if (tail.length) pipe.write(tail)
-      pipe.end()
-    }
+    if (state !== 'closed') process(Buffer.alloc(0), true)
+    if (state !== 'closed') return fail(400, 'bad-multipart')
+    state = 'done'; pipe.end()
   })
 }
 
@@ -4111,7 +5374,9 @@ function fsUploadMultipart(req, res, url, dirLex, dirReal, boundary) {
  */
 function fsPartPath(dirReal, name, session) {
   const s = String(session || 'default').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64) || 'default'
-  return path.join(dirReal, `.${name}.dsh-remote-part-${s}`)
+  let partName = `.${name}.dsh-remote-part-${s}`
+  if (Buffer.byteLength(partName) > 255) partName = `.dsh-remote-part-${crypto.createHash('sha256').update(name).digest('hex').slice(0, 32)}-${s}`
+  return path.join(dirReal, partName)
 }
 
 function fsTargetState(target) {
@@ -4561,20 +5826,7 @@ function serveHandoff(req, res, url) {
   }
 
   // PUT：读 JSON 体，字段白名单 + 截断，4KB 上限
-  let body = ''
-  let done = false
-  req.on('data', chunk => {
-    if (done) return
-    body += chunk
-    if (Buffer.byteLength(body) > 4096) {
-      done = true
-      fsJson(res, 413, { error: 'payload too large' })
-      req.destroy()
-    }
-  })
-  req.on('end', () => {
-    if (done || res.headersSent) return
-    done = true
+  withRequestBody(req, res, 4096, body => {
     let payload
     try {
       payload = JSON.parse(body || '{}')
@@ -4650,23 +5902,13 @@ function serveWorkbench(req, res, url) {
   }
 
   if (sub === '/bind' && req.method === 'POST') {
-    let body = ''
     let done = false
     const fail = (status, payload) => {
       if (done || res.headersSent) return
       done = true
       fsJson(res, status, payload)
     }
-    req.on('data', chunk => {
-      if (done) return
-      body += chunk
-      if (Buffer.byteLength(body) > 4096) {
-        req.destroy()
-        fail(413, { error: 'too-large' })
-      }
-    })
-    req.on('error', () => { if (!done) done = true })
-    req.on('end', () => {
+    withRequestBody(req, res, 4096, body => {
       if (done) return
       try {
         const rawPath = JSON.parse(body || '{}')?.path
@@ -4701,6 +5943,7 @@ function serveWorkbench(req, res, url) {
 
 // ---------- /api 代理 ----------
 const ADAPTIVE_RPC_METHODS = new Set([
+  'agentPresets.list', 'permissionPresets.catalog',
   'host.describe', 'session.list', 'session.history', 'session.models', 'session.search',
   'session.create', 'session.selectModel', 'session.rename', 'session.fork', 'session.prompt',
   'session.attachment', 'session.updateQueue', 'session.cancel', 'workspace.list',
@@ -4742,10 +5985,10 @@ async function bridgeVisionPrompt(payload) {
     redirect: 'error',
   })
   const configResponse = await pluginFetch('config')
-  if (configResponse.status === 404) throw new Error('当前模型不支持图片，未找到兼容的 dsh-image-vision 插件；请安装并启用视觉辅助插件，或切换视觉模型。')
+  if (configResponse.status === 404) throw Object.assign(new Error('当前模型不支持图片，未找到兼容的 dsh-image-vision 插件；请安装并启用视觉辅助插件，或切换视觉模型。'), { code: 'VISION_PLUGIN_MISSING' })
   if (!configResponse.ok) throw new Error('无法检查视觉辅助插件状态，请稍后重试。')
   const config = await configResponse.json()
-  if (config?.config?.enabled !== true) throw new Error('当前模型不支持图片，视觉辅助插件尚未开启。请在 DSH 中启用插件后重试。')
+  if (config?.config?.enabled !== true) throw Object.assign(new Error('当前模型不支持图片，视觉辅助插件尚未开启。请在 DSH 中启用插件后重试。'), { code: 'VISION_PLUGIN_DISABLED' })
   const content = []
   for (const part of payload.content) {
     if (part?.type !== 'image') { content.push(part); continue }
@@ -4785,7 +6028,7 @@ async function forwardLegacyRpc(url, raw, allowVisionBridge = true) {
         const bridged = await bridgeVisionPrompt(request.payload)
         if (bridged) return forwardLegacyRpc(url, JSON.stringify({ ...request, payload: bridged }), false)
       } catch (error) {
-        return { ...result, status: 200, raw: JSON.stringify(legacyEnvelope(request.rpcId, modernError(error.message, 'image-vision-failed'))) }
+        return { ...result, status: 200, raw: JSON.stringify(legacyEnvelope(request.rpcId, modernError(error.message, 'image-vision-failed', { reason: error.code }))) }
       }
     }
   }
@@ -4798,6 +6041,175 @@ function sendBufferedUpstreamResponse(res, response) {
     'content-type': response.headers?.get?.('content-type') || 'application/json; charset=utf-8',
     'cache-control': 'no-store',
   }, response.raw || '', compressibleRpc(res.req))
+}
+
+// A durable receipt records intent before forwarding. Only a hash of the
+// payload is stored. A crash/timeout is UNKNOWN, never permission to replay a
+// potentially committed upstream write. Old DSH needs no invented RPC support.
+const OPERATION_METHODS = new Set(['session.fork', 'session.create', 'session.prompt', 'session.updateQueue',
+  'session.selectModel', 'session.rename', 'session.cancel', 'workspace.create',
+  'workspace.archiveSession', 'goal.edit', 'goal.pause', 'goal.resume', 'goal.complete', 'goal.clear'])
+const OPERATION_DIR = path.join(path.dirname(TOKEN_FILE), 'operations')
+const OPERATION_TTL = 24 * 60 * 60 * 1000
+const operationJobs = new Map()
+function operationHash(value) { return crypto.createHash('sha256').update(value).digest('hex') }
+function operationJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(operationJson).join(',') + ']'
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + operationJson(value[k])).join(',') + '}'
+  return JSON.stringify(value)
+}
+function saveOperation(key, job) {
+  fs.mkdirSync(OPERATION_DIR, { recursive: true, mode: 0o700 })
+  const target = path.join(OPERATION_DIR, key + '.json')
+  fs.writeFileSync(target + '.tmp', JSON.stringify(job), { mode: 0o600 })
+  fs.renameSync(target + '.tmp', target)
+}
+function loadOperation(key) {
+  if (operationJobs.has(key)) {
+    const job = operationJobs.get(key)
+    if (Date.now() - job.createdAt <= OPERATION_TTL) return job
+    operationJobs.delete(key)
+  }
+  try {
+    const job = JSON.parse(fs.readFileSync(path.join(OPERATION_DIR, key + '.json'), 'utf8'))
+    if (Date.now() - job.createdAt > OPERATION_TTL) return null
+    if (job.phase === 'running') { job.phase = 'unknown'; job.error = 'gateway-restarted'; saveOperation(key, job) }
+    operationJobs.set(key, job)
+    return job
+  } catch { return null }
+}
+function operationSnapshot(job) {
+  return { id: job.id, method: job.method, phase: job.phase, createdAt: job.createdAt,
+    completedAt: job.completedAt || null, ...(job.result ? { result: job.result } : {}), ...(job.error ? { error: job.error } : {}), ...(job.diagnostic ? { diagnostic: job.diagnostic } : {}) }
+}
+function operationFailureFacts(error, stage, createdAt) {
+  const categories = ['upstream-http', 'invalid-response', 'network', 'timeout']
+  const code = error?.cause?.code || error?.code
+  const timeout = ['AbortError', 'TimeoutError'].includes(error?.name) || ['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(code)
+  const network = ['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_SOCKET'].includes(code)
+  const category = categories.includes(error?.receiptCategory) ? error.receiptCategory : timeout ? 'timeout' : network ? 'network' : 'upstream-uncertain'
+  const stages = ['protocol-detection', 'modern-request', 'legacy-request', 'response-validation', 'vision-submit']
+  const httpStatus = error?.httpStatus
+  return { category, stage: stages.includes(error?.receiptStage) ? error.receiptStage : stage,
+    ...(Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599 ? { httpStatus } : {}),
+    durationMs: Math.max(0, Date.now() - createdAt) }
+}
+function operationResult(body) {
+  const guidance = {
+    'image-vision-failed': '图片处理未完成，消息尚未提交。请检查视觉辅助插件或切换支持图片的模型。',
+    'session/agent-busy': '当前会话正忙，请等待当前任务结束后再操作。',
+    'session/not-found': '会话不存在，请刷新列表后重新打开。',
+    'session/model-not-found': '所选模型不可用，请重新选择模型。',
+    'session/attachment-invalid': '图片或附件未被主机接受，请检查文件及所选模型的支持情况。',
+  }
+  const visionGuidance = {
+    VISION_PLUGIN_MISSING: '当前模型不支持图片，且未安装视觉辅助插件。请安装并启用 dsh-image-vision，或切换支持图片的模型。',
+    VISION_PLUGIN_DISABLED: '当前模型不支持图片，视觉辅助插件尚未开启。请启用插件或切换支持图片的模型。',
+  }
+  const code = String(body.result.error?.code || 'operation-rejected').slice(0, 120)
+  if (body.result.ok !== true) return { result: { ok: false, error: {
+    code,
+    message: (code === 'image-vision-failed' && Object.hasOwn(visionGuidance, body.result.error?.details?.reason) && visionGuidance[body.result.error.details.reason]) || (Object.hasOwn(guidance, code) && guidance[code]) || '主机拒绝了操作，请核对会话和当前配置。'
+  } } }
+  const input = body.result.value || {}, value = {}
+  for (const key of ['accepted', 'sessionId', 'workspaceId', 'archivedSessionIds', 'ref', 'selected', 'model', 'cleared']) {
+    if (input[key] !== undefined) value[key] = input[key]
+  }
+  if (input.workspace) value.workspace = Object.fromEntries(['workspaceId','path','title','sessionIds'].filter(key => input.workspace[key] !== undefined).map(key => [key,input.workspace[key]]))
+  return { result: { ok: true, value } }
+}
+async function executeOperation(key, job, payload) {
+  const request = { type: 'client-request', rpcId: job.id, method: job.method,
+    payload: job.method === 'session.prompt' ? { ...payload, requestId: job.id } : payload }
+  let stage = 'protocol-detection'
+  let responseStatus
+  try {
+    let body
+    const url = new URL('/api/' + job.method, UPSTREAM)
+    if (await detectUpstreamApiFlavor() === 'modern') {
+      stage = 'modern-request'
+      body = await translateModernRpc(job.method, request.payload, request.rpcId, true)
+    }
+    if (!body || body.__dshRemoteLegacyFallback) {
+      stage = 'legacy-request'
+      const legacy = await forwardLegacyRpc(url, JSON.stringify(request))
+      responseStatus = legacy.status
+      if ([404, 405, 501].includes(legacy.status)) {
+        body = await translateModernRpc(job.method, request.payload, request.rpcId, true)
+        if (body?.__dshRemoteLegacyFallback) body = null
+      } else if (legacy.status >= 500) throw Object.assign(new Error('upstream-uncertain'), { httpStatus: legacy.status, receiptCategory: 'upstream-http' })
+      else {
+        try { body = JSON.parse(legacy.raw) } catch { throw Object.assign(new Error('upstream-uncertain'), { httpStatus: legacy.status, receiptCategory: 'invalid-response' }) }
+      }
+    }
+    stage = 'response-validation'
+    if (typeof body?.result?.ok !== 'boolean' || Buffer.byteLength(JSON.stringify(body)) > 256 * 1024) throw Object.assign(new Error('upstream-uncertain'), { receiptCategory: 'invalid-response', httpStatus: responseStatus })
+    job.result = operationResult(body)
+    job.phase = body.result.ok === true ? 'complete' : 'rejected'
+  } catch (error) {
+    job.phase = 'unknown'
+    job.error = 'result-unconfirmed'
+    job.diagnostic = operationFailureFacts(error, stage, job.createdAt)
+  }
+  job.completedAt = Date.now()
+  if (job.diagnostic) {
+    const facts = { method: job.method, phase: job.phase, ...job.diagnostic }
+    recordCompatibility('operation-result', facts)
+    console.warn('[operation]', JSON.stringify(facts))
+  }
+  try { saveOperation(key, job) } catch {
+    // The durable intent remains running and becomes unknown after restart.
+    // Do not return a success that could not be durably recorded.
+    job.phase = 'unknown'; delete job.result; job.error = 'receipt-save-failed'
+  }
+}
+async function serveOperations(req, res, url) {
+  cors(res, req)
+  const reply = (status, value) => sendHttpBody(res, status, {
+    'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store'
+  }, JSON.stringify(value), true)
+  if (req.method === 'OPTIONS') return reply(204, {})
+  if (!['GET', 'POST'].includes(req.method)) return reply(405, { error: 'method-not-allowed' })
+  if (!controlAuthorized(req, url)) return reply(401, { error: 'unauthorized' })
+  touchDevice(req)
+  const id = String(url.searchParams.get('id') || '')
+  if (!/^[A-Za-z0-9_-]{16,80}$/.test(id)) return reply(400, { error: 'bad-operation-id' })
+  // Credentials and upstream participate in the scope. An address alias is not
+  // automatically trusted as the same logical host, and device keys cannot read
+  // the shared token's operation results.
+  const key = operationHash(UPSTREAM.origin + '\0' + String(tokenOf(req, url) || '') + '\0' + id)
+  let old = loadOperation(key)
+  if (req.method === 'GET') return old ? reply(200, operationSnapshot(old)) : reply(404, { error: 'operation-not-found' })
+  let body
+  try { body = JSON.parse(await readApiRequest(req)) } catch { return reply(400, { error: 'bad-operation' }) }
+  if (!OPERATION_METHODS.has(body?.method) || !body.payload || typeof body.payload !== 'object' || Array.isArray(body.payload)) {
+    return reply(400, { error: 'unsupported-operation' })
+  }
+  const fingerprint = operationHash(operationJson({ method: body.method, payload: body.payload }))
+  old = loadOperation(key) // The request body yielded; another POST may have won.
+  if (old) {
+    if (old.fingerprint !== fingerprint) return reply(409, { error: 'operation-conflict' })
+    return reply(old.phase === 'running' ? 202 : 200, operationSnapshot(old))
+  }
+  // Bounded receipts. Never evict an uncertain intent merely to allow replay.
+  try {
+    fs.mkdirSync(OPERATION_DIR, { recursive: true, mode: 0o700 })
+    for (const name of fs.readdirSync(OPERATION_DIR)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue
+      const target = path.join(OPERATION_DIR, name)
+      if (Date.now() - fs.statSync(target).mtimeMs > OPERATION_TTL) {
+        fs.unlinkSync(target); operationJobs.delete(name.slice(0, -5))
+      }
+    }
+    if (fs.readdirSync(OPERATION_DIR).filter(n => n.endsWith('.json')).length >= 1000) return reply(429, { error: 'operation-capacity' })
+  } catch { return reply(503, { error: 'receipt-unavailable' }) }
+  const job = { id, method: body.method, fingerprint, phase: 'running', createdAt: Date.now() }
+  try { saveOperation(key, job) } catch { return reply(503, { error: 'receipt-unavailable' }) }
+  operationJobs.set(key, job)
+  // Reply before the upstream completes. A dropped HTTP response never cancels
+  // or starts a second operation. The client only retries GET status requests.
+  reply(202, operationSnapshot(job))
+  void executeOperation(key, job, body.payload)
 }
 
 async function proxyLegacyRpcWithModernFallback(req, res, url) {
@@ -4898,14 +6310,15 @@ async function proxyLegacyApi(req, res, url) {
     return proxyLegacyRpcWithModernFallback(req, res, url)
   }
   const headers = {}
+  const connectionHeaders = String(req.headers.connection || '').toLowerCase().split(',').map(value => value.trim())
   for (const [k, v] of Object.entries(req.headers)) {
     if (v === undefined) continue
     const key = k.toLowerCase()
     if (['host', 'authorization', 'cookie', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
-      'proxy-connection', 'accept-encoding', 'origin', 'referer',
+      'proxy-connection', 'te', 'trailer', 'proxy-authenticate', 'proxy-authorization', 'accept-encoding', 'origin', 'referer',
       'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user',
       'x-dsh-remote-client'].includes(key)) continue
-    headers[k] = v
+    if (!connectionHeaders.includes(key)) headers[k] = v
   }
   headers.host = UPSTREAM.host
   Object.assign(headers, dshUpstreamHeaders())
@@ -4921,6 +6334,7 @@ async function proxyLegacyApi(req, res, url) {
     headers
   }, (upstreamRes) => {
     const out = { ...upstreamRes.headers }
+    for (const key of ['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-connection', 'proxy-authenticate', 'proxy-authorization', ...String(out.connection || '').toLowerCase().split(',').map(value => value.trim())]) delete out[key]
     delete out['content-length']
     cors(res)
     res.writeHead(upstreamRes.statusCode || 502, out)
@@ -4933,7 +6347,9 @@ async function proxyLegacyApi(req, res, url) {
     upstreamRes.pipe(res)
   })
 
-  upstreamReq.setTimeout(UPSTREAM_REQUEST_TIMEOUT_MS, () => {
+  const requestTimeout = ['/api/session.export', '/remote/api/command'].includes(url.pathname)
+    ? Math.max(UPSTREAM_REQUEST_TIMEOUT_MS, 130000) : UPSTREAM_REQUEST_TIMEOUT_MS
+  upstreamReq.setTimeout(requestTimeout, () => {
     upstreamReq.destroy(new Error('upstream request timeout'))
   })
   upstreamReq.on('error', (err) => {
@@ -4964,8 +6380,12 @@ function proxyApi(req, res, url) {
   const remoteClientPath = ['/remote/api/command', '/remote/api/command-status', '/remote/admin/api/dsh'].includes(url.pathname)
     || (url.pathname === '/remote/api/session-file' && ['GET','HEAD'].includes(req.method))
     || (url.pathname === '/remote/api/insights/cost' && req.method === 'GET')
+    || (url.pathname === '/remote/api/insights/peak-reminders' && req.method === 'GET')
+    || (url.pathname === '/remote/api/teams' && req.method === 'GET')
+    || (url.pathname === '/remote/api/task-board' && req.method === 'GET')
+    || (url.pathname === '/remote/api/doctor/target' && req.method === 'GET')
     || /^\/remote\/api\/skills\/(list|read)$/.test(url.pathname)
-    || /^\/remote\/api\/plugins\/(state|details|market|operations|recover)$/.test(url.pathname)
+    || /^\/remote\/api\/plugins\/(state|details|readme|market(?:\/indexes)?|operations|preflight|recover)$/.test(url.pathname)
   const remoteAdminPath = url.pathname.startsWith('/remote/') && !remoteClientPath
   const ok = remoteAdminPath ? adminAuthorized(req, url) : remoteClientPath ? controlAuthorized(req, url) : authorized(req, url)
   touchDevice(req, ok ? {} : { failedAuth: true })
@@ -4990,10 +6410,17 @@ function proxyApi(req, res, url) {
 // grants restart authority. Actual lifecycle actions still verify fresh evidence.
 let healthProbeState = { ok: false, reachable: false, status: 0, checkedAt: 0, error: '' }
 let healthProbeTask = null
+// `/health?probe=fresh` deliberately bypasses the cache below, so its response is bounded
+// only by this probe budget. The web/desktop clients abort that request after 6500ms
+// (GATEWAY_PROBE_ABORT_MS), which must stay strictly above the ceiling here, otherwise a
+// merely slow upstream is reported to the user as a probe failure.
+// tests/health-probe-budget.test.js locks that relationship. Concurrent callers still
+// share the single in-flight probe.
+const DSH_PROBE_TIMEOUT_MS = durationEnv('DSH_PROBE_TIMEOUT_MS', 5000, 500, 6000)
 function refreshHealthProbe(force = false) {
   if (healthProbeTask) return healthProbeTask
   if (!force && healthProbeState.checkedAt && Date.now() - healthProbeState.checkedAt < 5000) return Promise.resolve(healthProbeState)
-  healthProbeTask = probeDshUpstream(5000).then(value => {
+  healthProbeTask = probeDshUpstream(DSH_PROBE_TIMEOUT_MS).then(value => {
     healthProbeState = { ...value, checkedAt: Date.now() }
     return healthProbeState
   }).finally(() => { healthProbeTask = null })
@@ -5038,7 +6465,9 @@ async function serveHealth(req, res, url) {
   }]))
   const liveness = { ok: true, pid: process.pid, uptimeMs: Math.max(0, Date.now() - STARTED_AT), runtime: runtimeState }
   const live = url?.searchParams.get('probe') === 'live'
-  const probeTask = refreshHealthProbe()
+  const fresh = url?.searchParams.get('probe') === 'fresh'
+  const probeTask = refreshHealthProbe(fresh)
+  if (fresh) await probeTask
   // A small cold-start budget preserves useful readiness on fast local upstreams.
   if (!live && !healthProbeState.checkedAt) await Promise.race([probeTask, delay(100)])
   const { ok: upstreamOk, reachable: upstreamReachable, status: upstreamStatus, error: upstreamError } = healthProbeState
@@ -5088,6 +6517,7 @@ function lanAddresses() {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://dsh-remote.local')
+    if (url.pathname === '/relay') return await serveRelaySettings(req, res, url)
     if (url.pathname === '/fs' || url.pathname.startsWith('/fs/')) return await serveFs(req, res, url)
     if (url.pathname === '/workbench' || url.pathname.startsWith('/workbench/')) return serveWorkbench(req, res, url)
     if (url.pathname === '/diagnostics') return serveDiagnostics(req, res, url)
@@ -5104,6 +6534,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/admin/api')) return await serveAdminApi(req, res, url)
     if (url.pathname.startsWith('/stats')) return serveStats(req, res, url)
     if (url.pathname === '/api/ws-ticket') return serveWsTicket(req, res, url)
+    if (url.pathname === '/api/operations') return await serveOperations(req, res, url)
     if (url.pathname === '/api/events.poll') return serveEventPoll(req, res, url)
     if (url.pathname.startsWith('/remote/')) return proxyApi(req, res, url)
     if (url.pathname.startsWith('/api/')) return proxyApi(req, res, url)
@@ -5115,7 +6546,7 @@ const server = http.createServer(async (req, res) => {
     try {
       if (!res.headersSent) {
         res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
-        res.end(JSON.stringify({ error: 'internal', detail: String(err?.message || err) }))
+        res.end(JSON.stringify({ error: 'internal' }))
       } else {
         res.destroy()
       }
@@ -5297,7 +6728,10 @@ function acceptCollectorClient(req, socket, head, kind, device) {
   // Pong 8a03010203）。这里按 RFC6455 组帧：维护 per-socket 缓冲，帧头
   // （含 126/127 扩展长度）与载荷凑齐才应答，整帧消费，控制帧间数据帧安全跳过。
   let rx = Buffer.alloc(0)
+  let closing = false
+  let stopHeartbeat = () => {}
   socket.on('data', (chunk) => {
+    if (closing) return
     rx = rx.length ? Buffer.concat([rx, chunk]) : chunk
     while (true) {
       let frame
@@ -5310,6 +6744,30 @@ function acceptCollectorClient(req, socket, head, kind, device) {
       if (!frame) break
       if (typeof frame === 'string') { rx = Buffer.alloc(0); break }
       rx = rx.subarray(frame.total)
+      if (frame.opcode === 0x8) {
+        // Complete the peer's close handshake instead of retaining a CLOSING
+        // client until its implementation timeout (and still broadcasting to it).
+        let payload = frame.payload, errorCode = 0
+        if (!frame.fin || payload.length > 125 || payload.length === 1) errorCode = 1002
+        else if (payload.length >= 2) {
+          const code = payload.readUInt16BE(0)
+          if (!(code >= 1000 && code <= 1014 && ![1004, 1005, 1006].includes(code) || code >= 3000 && code <= 4999)) errorCode = 1002
+          else try { new TextDecoder('utf-8', { fatal: true }).decode(payload.subarray(2)) } catch { errorCode = 1007 }
+        }
+        if (errorCode) { payload = Buffer.alloc(2); payload.writeUInt16BE(errorCode) }
+        closing = true
+        rx = Buffer.alloc(0)
+        stopHeartbeat()
+        collectorClients[kind].delete(socket)
+        eventCollectorState[kind].clients = collectorClients[kind].size
+        const reply = Buffer.alloc(2 + payload.length)
+        reply[0] = 0x88; reply[1] = payload.length; payload.copy(reply, 2)
+        const timer = setTimeout(() => socket.destroy(), 1000)
+        timer.unref?.()
+        socket.once('close', () => clearTimeout(timer))
+        try { socket.end(reply) } catch { socket.destroy() }
+        return
+      }
       if (frame.payload.length > 125) continue
       if (frame.fin === false) continue
       // 仅应答 Ping（RFC6455 §5.5 控制帧载荷上限 125）；Pong（0xA）消费后丢弃，
@@ -5326,9 +6784,13 @@ function acceptCollectorClient(req, socket, head, kind, device) {
   })
   for (const raw of collectorReplay[kind].values()) {
     if (socket.destroyed || !socket.writable) break
-    try { socket.write(encodeWsText(raw)) } catch { break }
+    try {
+      const frame=encodeWsText(raw)
+      if(socket.writableLength+frame.length>WS_CLIENT_BUFFER_MAX){socket.destroy();break}
+      socket.write(frame)
+    } catch { break }
   }
-  const stopHeartbeat = startWsClientHeartbeat(socket, () => socket.destroy())
+  stopHeartbeat = startWsClientHeartbeat(socket, () => socket.destroy())
   const release = () => {
     stopHeartbeat()
     collectorClients[kind].delete(socket)
@@ -5388,15 +6850,16 @@ server.on('upgrade', (req, socket, head) => {
   socket.once('close', release)
 
   const headers = {}
+  const connectionHeaders = String(req.headers.connection || '').toLowerCase().split(',').map(value => value.trim())
   for (const [k, v] of Object.entries(req.headers)) {
     if (v === undefined) continue
     const key = k.toLowerCase()
-    if (['host', 'authorization', 'cookie', 'connection', 'upgrade', 'sec-websocket-key',
+    if (['host', 'authorization', 'cookie', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'sec-websocket-key',
       'sec-websocket-version', 'sec-websocket-extensions', 'sec-websocket-protocol',
-      'proxy-connection', 'accept-encoding', 'origin', 'referer',
+      'proxy-connection', 'te', 'trailer', 'proxy-authenticate', 'proxy-authorization', 'accept-encoding', 'origin', 'referer',
       'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user',
       'x-dsh-remote-client'].includes(key)) continue
-    headers[k] = v
+    if (!connectionHeaders.includes(key)) headers[k] = v
   }
   headers.host = UPSTREAM.host
   Object.assign(headers, dshUpstreamHeaders())
@@ -5490,6 +6953,9 @@ server.on('clientError', (err, socket) => {
 })
 
 server.listen(PORT, HOST, () => {
+  restoreDshControl()
+  relayHost.startSaved()
+  void loginAutostart.refresh().catch(() => { console.error('[autostart] refresh failed; reopen login startup settings') })
   void refreshHealthProbe()
   void dshControlDescription()
   const healthRefresh = setInterval(() => { void refreshHealthProbe(true); void dshControlDescription(true) }, 5000)

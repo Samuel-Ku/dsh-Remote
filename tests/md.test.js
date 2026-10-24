@@ -3,6 +3,48 @@
 const test = require('node:test')
 const assert = require('node:assert')
 const mdToHtml = require('../public/md.js')
+const boundedRenderer = require('./fixtures/bounded-markdown.cjs')
+
+test('issue 22: CRLF and CR markdown render like LF without blocking', () => {
+  const render = boundedRenderer()
+  const blocks = [
+    'para\n# head\ntail', '## second\n### third',
+    'para\n> quote\ntail', '- first\n- second', '* first\n* second',
+    '+ first\n+ second', '1. first\n2. second', '3) third\n4) fourth',
+    '1. parent\n   - child\n\n2. next',
+    '| name | value |\n| --- | --- |\n| a | b |',
+    '```js\nconst a = 1\n```\n# after',
+    '```dsh-ui\n{"type":"text","text":"hello"}\n```\n> after',
+    '# <script>alert(1)</script>\n> [x](javascript:alert(1))'
+  ]
+  for (const source of blocks) {
+    const expected = render(source)
+    for (const newline of ['\r\n', '\r']) {
+      assert.strictEqual(render(source.replace(/\n/g, newline)), expected, JSON.stringify({ source, newline }))
+    }
+  }
+  assert.strictEqual(render('para\r\n# head\rtail\n> quote'), render('para\n# head\ntail\n> quote'))
+})
+
+test('issue 22: a trailing CR block marker also completes without losing content', () => {
+  const render = boundedRenderer()
+  for (const source of ['# head', '## head', '### head', '> quote', '- item', '* item', '1. item', '1) item']) {
+    assert.strictEqual(render(source + '\r'), render(source), source)
+  }
+})
+
+test('markdown block fallback advances and retains escaped text for unmatched line separators', () => {
+  const render = boundedRenderer()
+  for (const separator of ['\u2028', '\u2029']) {
+    for (const marker of ['# ', '> ']) {
+      const source = marker + 'keep' + separator + '<script>bad</script>'
+      const html = render(source + '\n# after')
+      assert.ok(html.includes('keep' + separator + '&lt;script&gt;bad&lt;/script&gt;'))
+      assert.ok(html.includes('<h1>after</h1>'))
+      assert.ok(!html.includes('<script>'))
+    }
+  }
+})
 
 test('mdToHtml: escapes HTML and renders basic markdown', () => {
   const html = mdToHtml('# Hi\n\n**bold** and *italic*')
@@ -50,4 +92,31 @@ test('mdToHtml: a pipe line without a separator is not treated as a table', () =
   assert.ok(!html.includes('<table>'))
   assert.ok(html.includes('<p>'))
   assert.ok(html.includes('a | b'))
+})
+
+test('mdToHtml: screenshot regression keeps loose numbering and nested alternatives', () => {
+  const html = mdToHtml('1. **命名规范**：提供学号\n\n2. **干涉检查**：三个办法：\n\n   - A：参照体\n   - B：零件\n   - C：间隙\n\n3. **主装配基准面**\n\n4. **规则措辞**')
+  assert.equal((html.match(/<ol>/g) || []).length, 1)
+  assert.equal((html.match(/<li>/g) || []).length, 7)
+  assert.ok(html.includes('<ul><li>A：参照体</li><li>B：零件</li><li>C：间隙</li></ul></li><li><p><strong>主装配基准面'))
+})
+
+test('mdToHtml: ordered list starts survive separate blocks and repeated source markers count normally', () => {
+  assert.equal(mdToHtml('3. third\n4. fourth'), '<ol start="3"><li>third</li><li>fourth</li></ol>')
+  assert.equal(mdToHtml('1. first\n\n1. second'), '<ol><li><p>first</p></li><li><p>second</p></li></ol>')
+  assert.equal(mdToHtml('2) second\n\n# New section\n\n4. fourth'), '<ol start="2"><li>second</li></ol><h1>New section</h1><ol start="4"><li>fourth</li></ol>')
+})
+
+test('mdToHtml: continuation paragraphs, nested numbering and top-level blocks stay separate', () => {
+  const html = mdToHtml('1. first\n   continuation\n\n   another paragraph\n\n   2. nested\n   3. nested again\n\n2. second\n\noutside\n\n- separate')
+  assert.equal(html, '<ol><li><p>first<br>continuation</p><p>another paragraph</p><ol start="2"><li>nested</li><li>nested again</li></ol></li><li><p>second</p></li></ol><p>outside</p><ul><li>separate</li></ul>')
+})
+
+test('mdToHtml: list markers support indentation and nested content stays escaped', () => {
+  const html = mdToHtml('  0. **zero**\n     + <script>bad</script>\n     + [x](javascript:alert(1))\n  1. next')
+  assert.ok(html.startsWith('<ol start="0"><li><strong>zero</strong><ul>'))
+  assert.ok(html.includes('&lt;script&gt;bad&lt;/script&gt;'))
+  assert.ok(!html.includes('<script>'))
+  assert.ok(!html.includes('href="javascript:'))
+  assert.ok(mdToHtml('- parent\n\t- child').includes('<ul><li>child</li></ul>'))
 })

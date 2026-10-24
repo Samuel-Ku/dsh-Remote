@@ -115,6 +115,12 @@ function rpcValue(method, payload, state) {
       if (workspace) workspace.sessionIds.unshift(created.sessionId)
       return { sessionId: created.sessionId }
     }
+    case 'session.fork': {
+      const parent = state.sessions.find(item => item.sessionId === payload.sessionId)
+      const child = { ...parent, sessionId: `session-fork-${++state.createdSessions}`, origin: 'fork', parentSessionId: payload.sessionId, running: false }
+      state.sessions.unshift(child)
+      return { sessionId: child.sessionId }
+    }
     case 'session.prompt': return { accepted: true }
     case 'session.cancel': return { accepted: true }
     case 'session.selectModel': return { accepted: true, model: payload.model }
@@ -141,13 +147,13 @@ function rpcValue(method, payload, state) {
     case 'goal.resume': return { accepted: true }
     case 'goal.complete': return { accepted: true }
     case 'goal.clear': return { accepted: true }
-    case 'subagent.list': return { entries: [{ id: 'child-1', label: '测试子任务', mode: 'continuable', activity: 'running' }] }
+    case 'subagent.list': return state.subagents?.[payload.parentSessionId] || { entries: payload.parentSessionId === 'session-1' ? [{ id: 'child-1', label: '测试子任务', mode: 'continuable', activity: 'running', hasChildren: true }] : payload.parentSessionId === 'child-1' ? [{ id: 'grandchild-1', label: '资料核对', mode: 'one-shot', activity: 'inactive', hasChildren: false }, { kind: 'diagnostic', id: 'unavailable-1', reason: 'unavailable' }] : [] }
     case 'subagent.interrupt': return { accepted: true }
     default: return { accepted: true, echo: payload }
   }
 }
 
-async function createDshServer(port, tmpRoot, records) {
+async function createDshServer(port, tmpRoot, records, options = {}) {
   let seq = 10
   const sockets = { mux: new Set(), host: new Set() }
   const state = {
@@ -203,6 +209,8 @@ async function createDshServer(port, tmpRoot, records) {
       if (!req.url.startsWith('/api/')) return json(res, 404, { error: 'not-found' })
       const body = await readJson(req)
       records.requests.push({ path: req.url, body, headers: req.headers })
+      const override = await options.rpcResponse?.(body)
+      if (override) return json(res, override.status, override.body)
       const method = body.method || req.url.slice('/api/'.length)
       const payload = body.payload || {}
       if (method === 'session.prompt') {
@@ -253,6 +261,15 @@ async function createDshServer(port, tmpRoot, records) {
     },
     pushAssistant(text) {
       broadcastSessionEvent({ seq: ++seq, type: 'assistant/message', data: { role: 'assistant', content: [{ type: 'text', text }] } })
+    },
+    emitAgentError(sessionId, message) {
+      broadcast('host', { type: 'host/agent-error', sessionId, message })
+    },
+    async restart() {
+      const port=server.address().port
+      for(const group of Object.values(sockets))for(const socket of group)socket.destroy()
+      await new Promise(resolve=>server.close(resolve))
+      await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve)})
     },
     async close() {
       for (const group of Object.values(sockets)) for (const socket of group) socket.destroy()
@@ -352,13 +369,14 @@ async function createRealisticStack(options = {}) {
       { id: 'stability', label: '连接稳定性' }, { id: 'files', label: '文件能力' },
     ] },
   }] }))
-  const dsh = await createDshServer(0, tmpRoot, records)
+  const dsh = await createDshServer(0, tmpRoot, records, options)
   const feedback = options.publicFeedback ? null : await createFeedbackCollector(0, records)
   let logs = ''
   const env = {
     ...process.env,
     HOME: tmpRoot,
     USERPROFILE: tmpRoot,
+    DSH_HOME: tmpRoot,
     PORT: String(gatewayPort),
     HOST: '127.0.0.1',
     TOKEN: token,
@@ -385,16 +403,20 @@ async function createRealisticStack(options = {}) {
   delete env.http_proxy
   delete env.https_proxy
   delete env.all_proxy
-  const gateway = spawn(process.execPath, [GATEWAY], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] })
   const capture = chunk => { logs = (logs + chunk.toString()).slice(-12000) }
-  gateway.stdout.on('data', capture)
-  gateway.stderr.on('data', capture)
-  await waitFor(async () => {
+  const launchGateway = () => {
+    const child=spawn(process.execPath,[GATEWAY],{cwd:ROOT,env,stdio:['ignore','pipe','pipe']})
+    child.stdout.on('data',capture);child.stderr.on('data',capture)
+    return child
+  }
+  let gateway=launchGateway()
+  const waitForGateway = () => waitFor(async () => {
     const res = await fetch(`http://127.0.0.1:${gatewayPort}/health`, { signal: AbortSignal.timeout(500) })
     if (!res.ok) return false
     const health = await res.json()
     return health.upstreamOk && health.events?.mux?.connected && health.events?.host?.connected
   }, 7000, `gateway failed to become healthy\n${logs}`)
+  await waitForGateway()
   const mobileProxy = await createMobileUiProxy(0, gatewayPort, dsh, records)
 
   let stopped = false
@@ -406,6 +428,15 @@ async function createRealisticStack(options = {}) {
     records,
     dsh,
     logs: () => logs,
+    async restartGateway() {
+      if(stopped)throw Error('Test stack is stopped')
+      const previous=gateway
+      if(previous.exitCode===null)previous.kill('SIGTERM')
+      if(previous.exitCode===null)await once(previous,'exit')
+      gateway=launchGateway()
+      await waitForGateway()
+      return gateway.pid
+    },
     async stop() {
       if (stopped) return
       stopped = true

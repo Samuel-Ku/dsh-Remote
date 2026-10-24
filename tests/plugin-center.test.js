@@ -12,6 +12,11 @@ const id = '12345678-1234-1234-1234-123456789abc'
 
 function fixture(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-plugin-center-'))
+  const envKeys=['HOME','USERPROFILE','DSH_REMOTE_FS_ROOT','TOKEN','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy','NODE_USE_ENV_PROXY']
+  const previous=Object.fromEntries(envKeys.map(key=>[key,process.env[key]]))
+  Object.assign(process.env,{HOME:home,USERPROFILE:home,DSH_REMOTE_FS_ROOT:home,TOKEN:'plugin-center-test-token'})
+  for(const key of envKeys.slice(4))delete process.env[key]
+  t.after(()=>{for(const [key,value] of Object.entries(previous)){if(value===undefined)delete process.env[key];else process.env[key]=value}})
   t.after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
   const dir = path.join(home, 'profiles', 'web')
   fs.mkdirSync(dir, { recursive: true })
@@ -129,11 +134,18 @@ test('plugin center binds to verified root profile; unknown launch stays read-on
   const cli = path.join(root, 'lib', 'bin.js'); fs.writeFileSync(cli, '')
   const ctx = { root: { baseUrl: pathToFileURL(dir + path.sep).href } }
   assert.equal(detectProfile(ctx, cli).dir, fs.realpathSync(dir))
-  assert.equal(detectProfile(ctx, cli).cli, cli)
+  assert.equal(detectProfile(ctx, cli).cli, fs.realpathSync(cli))
   assert.equal(detectProfile({}, cli), null)
   const center = createPluginCenter({}, { profile: null })
   assert.equal((await center.inventory()).writable, false)
   await assert.rejects(center.submit({}), /read-only/)
+})
+test('inventory inspects adapter service shapes without reading private data or snapshots', async t => {
+  const { createPluginCenter } = await modulePromise, { profile } = fixture(t)
+  const service = { getState() { assert.fail('Inventory must not query balances') }, snapshot() { assert.fail('Inventory must not query tasks') } }
+  const center = createPluginCenter({ get: name => ['costMeter','taskBoard'].includes(name) ? service : undefined }, { profile })
+  assert.deepEqual((await center.inventory()).adaptations, { cost: { supported: true }, tasks: { supported: true } })
+  assert.equal((await createPluginCenter({ get: name => name === 'costMeter' ? {} : undefined }, { profile }).inventory()).adaptations.cost.supported, false)
 })
 
 test('plugin operations reject injection, protected packages, stale revisions and non-bundles', async t => {
@@ -168,7 +180,7 @@ test('desktop discovery binds the carrier to the running Electron host and its e
   const ctx = { root: { baseUrl: pathToFileURL(desktop + path.sep).href } }
   const runtime = { versions: { electron: '40.0.0' }, argv: ['electron', entry, runtimeDir, desktop] }
   const detected = detectProfile(ctx, entry, runtime)
-  assert.equal(detected.cli, carrier); assert.equal(detected.cliMode, 'desktop')
+  assert.equal(detected.cli, fs.realpathSync(carrier)); assert.equal(detected.cliMode, 'desktop')
   assert.equal((await createPluginCenter(ctx, { profile: detected }).inventory()).writable, true)
   assert.equal(detectProfile(ctx, entry, { ...runtime, versions: {} }).cli, null)
   assert.equal(detectProfile(ctx, entry, { ...runtime, argv: ['electron', entry, runtimeDir, dir] }).cli, null)
@@ -257,6 +269,45 @@ test('failed install records failure, preserves backup and releases lock without
   assert.ok(fs.existsSync(path.join(dir, '.remote-plugin-center', 'backup-' + id, 'package.json')))
 })
 
+test('minimum release age diagnostics identify lockfile blockers including scoped packages', async () => {
+  const { immatureReleaseNotice } = await modulePromise
+  assert.equal(immatureReleaseNotice('unrelated error'), null)
+  const message = immatureReleaseNotice('[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION]\n  dsh-remote-plugin@0.8.0-rc.4 was published at 2026-10-18T11:57:57Z\n  @scope/plugin@1.0.0 was published at 2026-10-18T11:57:57Z')
+  assert.match(message, /dsh-remote-plugin@0.8.0-rc.4/)
+  assert.match(message, /@scope\/plugin@1.0.0/)
+  assert.match(message, /第一条/)
+  assert.match(message, /可能不是本次更新目标/)
+  assert.match(message, /未自动回滚/)
+  assert.match(immatureReleaseNotice('ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION'), /没有列出具体条目/)
+})
+
+test('policy failure keeps original configuration backup, reports actual blocker and never retries or edits policy', async t => {
+  const { createPluginCenter, runWorker } = await modulePromise
+  const { dir, profile } = fixture(t)
+  const policy = 'minimumReleaseAge: 1440\nminimumReleaseAgeExclude:\n  - dsh-remote-plugin@0.7.6\n  - dsh-remote-plugin@0.8.0-rc.4\n'
+  fs.writeFileSync(path.join(dir, 'pnpm-workspace.yaml'), policy)
+  fs.writeFileSync(path.join(dir, 'pnpm-lock.yaml'), 'original-lockfile')
+  const center = createPluginCenter({}, { profile, launch: async () => {}, details: async () => ({ bundle: true }) })
+  await center.submit({ id, name: 'example-plugin', action: 'update', version: '1.1.0', revision: (await center.inventory()).revision })
+  let attempts = 0
+  await runWorker(dir, profile.cli, id, async (_cli, _args, _dir, output) => {
+    attempts++
+    output('\u001b[31m[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION]\u001b[0m\n  dsh-remote-plugin@0.8.0-rc.4 was published at 2026-10-18T11:57:57Z\n')
+    fs.writeFileSync(path.join(dir, 'pnpm-lock.yaml'), 'partially-mutated-lockfile')
+    throw Error('DSH 插件命令失败，退出码 1')
+  })
+  const state = await center.inventory(), job = state.operations[0]
+  assert.equal(attempts, 1)
+  assert.equal(job.phase, 'failed')
+  assert.equal(job.restartRequired, true)
+  assert.match(job.message, /dsh-remote-plugin@0.8.0-rc.4/)
+  assert.match(job.message, /未自动回滚/)
+  assert.equal(state.busy, false)
+  assert.equal(fs.readFileSync(path.join(dir, 'pnpm-workspace.yaml'), 'utf8'), policy)
+  assert.equal(fs.readFileSync(path.join(dir, 'pnpm-lock.yaml'), 'utf8'), 'partially-mutated-lockfile')
+  assert.equal(fs.readFileSync(path.join(dir, '.remote-plugin-center', 'backup-' + id, 'pnpm-lock.yaml'), 'utf8'), 'original-lockfile')
+})
+
 test('real detached worker persists results across manager recreation', async t => {
   const { createPluginCenter } = await modulePromise
   const { profile } = fixture(t)
@@ -266,10 +317,10 @@ test('real detached worker persists results across manager recreation', async t 
   let state
   for (let i = 0; i < 100; i++) {
     state = await reopened.inventory()
-    if (state.operations[0]?.phase === 'complete') break
+    if (['complete','failed','interrupted'].includes(state.operations[0]?.phase)) break
     await new Promise(resolve => setTimeout(resolve, 50))
   }
-  assert.equal(state.operations[0]?.phase, 'complete')
+  assert.equal(state.operations[0]?.phase, 'complete', JSON.stringify(state.operations[0]))
   assert.equal(state.items.find(item => item.name === 'example-plugin').enabled, false)
 })
 
@@ -285,6 +336,25 @@ test('worker refuses a profile changed after operation acceptance', async t => {
   assert.equal(executed, false)
   assert.equal((await center.inventory()).operations[0].phase, 'failed')
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'))).description, manifest.description)
+})
+
+test('detached worker launched through a directory alias still runs its entrypoint', async t => {
+  const { createPluginCenter } = await modulePromise
+  const { home, profile } = fixture(t)
+  const alias = home + '-alias'
+  fs.symlinkSync(home, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  t.after(() => { if (process.platform === 'win32') fs.rmdirSync(alias); else fs.unlinkSync(alias) })
+  const aliased = { ...profile, dir: path.join(alias, 'profiles', 'web'), home: alias, cli: path.join(alias, 'cli.cjs') }
+  const center = createPluginCenter({}, { profile: aliased })
+  await center.submit({ id, name: 'example-plugin', action: 'disable', revision: (await center.inventory()).revision })
+  let state
+  for (let i = 0; i < 100; i++) {
+    state = await center.inventory()
+    if (['complete','failed','interrupted'].includes(state.operations[0]?.phase)) break
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  assert.equal(state.operations[0]?.phase, 'complete', JSON.stringify(state.operations[0]))
+  assert.equal(state.items.find(item => item.name === 'example-plugin').enabled, false)
 })
 
 test('crashed worker recovery waits for its live CLI child and preserves partial changes', async t => {
@@ -364,17 +434,32 @@ test('Remote self-update requires confirmation, backs up the old package and sur
  const remote=path.join(dir,'node_modules/dsh-remote-plugin');fs.mkdirSync(remote,{recursive:true})
  fs.writeFileSync(path.join(remote,'package.json'),JSON.stringify({name:'dsh-remote-plugin',type:'module',version:'1.0.0',dsh:{bundle:{patch:'./patch.yml'}}}))
  const worker=path.join(remote,'plugin-center.mjs');fs.copyFileSync(path.join(__dirname,'../packages/plugin/plugin-center.mjs'),worker)
- fs.writeFileSync(profile.cli,`const fs=require('node:fs'),p=require('node:path');const remote=p.join(process.cwd(),'node_modules/dsh-remote-plugin'),m=JSON.parse(fs.readFileSync('package.json'));m.dependencies['dsh-remote-plugin']='1.0.1';fs.writeFileSync('package.json',JSON.stringify(m));const pkg=JSON.parse(fs.readFileSync(p.join(remote,'package.json')));pkg.version='1.0.1';fs.writeFileSync(p.join(remote,'package.json'),JSON.stringify(pkg));fs.writeFileSync(p.join(remote,'plugin-center.mjs'),'export const upgraded=true;');`)
- const loaded=await import(pathToFileURL(worker));let child
- const center=loaded.createPluginCenter({}, {profile,details:async()=>({bundle:true}),launch:async args=>{
-  const env={...process.env,HOME:profile.home,USERPROFILE:profile.home,DSH_HOME:profile.home,DSH_REMOTE_FS_ROOT:profile.home,TOKEN:'self-update-fixture'}
-  for(const key of ['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'])delete env[key]
-  child=spawn(process.execPath,[worker,'--worker',...args],{env,stdio:'ignore',windowsHide:true});await once(child,'spawn');return child.pid
- }})
+ fs.copyFileSync(path.join(__dirname,'../packages/plugin/plugin-transaction.mjs'),path.join(remote,'plugin-transaction.mjs'))
+  fs.copyFileSync(path.join(__dirname,'../packages/plugin/market.mjs'),path.join(remote,'market.mjs'))
+ fs.writeFileSync(profile.cli,`const fs=require('node:fs'),p=require('node:path');const remote=p.join(process.cwd(),'node_modules/dsh-remote-plugin'),m=JSON.parse(fs.readFileSync('package.json'));m.dependencies['dsh-remote-plugin']='1.0.1';fs.writeFileSync('package.json',JSON.stringify(m));const pkg=JSON.parse(fs.readFileSync(p.join(remote,'package.json')));fs.renameSync(remote,remote+'-old');fs.mkdirSync(remote);pkg.version='1.0.1';fs.writeFileSync(p.join(remote,'package.json'),JSON.stringify(pkg));fs.writeFileSync(p.join(remote,'plugin-center.mjs'),'export const upgraded=true;');`)
+ const loaded=await import(pathToFileURL(worker))
+ const center=loaded.createPluginCenter({}, {profile,details:async()=>({bundle:true})})
  const body={id,action:'update',name:'dsh-remote-plugin',version:'1.0.1',revision:(await center.inventory()).revision}
  await assert.rejects(center.submit(body),/确认/)
  for(const action of ['remove','disable','enable'])await assert.rejects(center.submit({...body,action,confirmSelfUpdate:true}),/核心/)
- await center.submit({...body,confirmSelfUpdate:true});await once(child,'exit')
- const state=await createPluginCenter({}, {profile}).inventory();assert.equal(state.operations[0].phase,'complete');assert.equal(state.items.find(r=>r.name==='dsh-remote-plugin').version,'1.0.1')
+ await center.submit({...body,confirmSelfUpdate:true})
+ let state
+ for(let i=0;i<100;i++){state=await center.inventory();if(state.operations[0]?.phase==='complete'||state.operations[0]?.phase==='failed')break;await new Promise(resolve=>setTimeout(resolve,50))}
+ assert.ok(fs.existsSync(path.join(dir,'.remote-plugin-center','worker-'+id+'.mjs')))
+ state=await createPluginCenter({}, {profile}).inventory();assert.equal(state.operations[0].phase,'complete',state.operations[0].message+'\n'+state.operations[0].log);assert.equal(state.items.find(r=>r.name==='dsh-remote-plugin').version,'1.0.1')
  assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'.remote-plugin-center','backup-'+id,'remote-plugin/package.json'))).version,'1.0.0');assert.match(fs.readFileSync(worker,'utf8'),/upgraded=true/)
+})
+
+test('Remote rename EPERM preserves the backup, does not retry, and explains the required host recovery',async t=>{
+ const {createPluginCenter,runWorker}=await modulePromise,{profile,dir,manifest}=fixture(t)
+ manifest.dependencies['dsh-remote-plugin']='1.0.0';manifest.dsh.profile.bundles.push('dsh-remote-plugin');fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify(manifest))
+ const remote=path.join(dir,'node_modules/dsh-remote-plugin');fs.mkdirSync(remote)
+ fs.writeFileSync(path.join(remote,'package.json'),JSON.stringify({name:'dsh-remote-plugin',version:'1.0.0',dsh:{bundle:{patch:'./patch.yml'}}}))
+ const center=createPluginCenter({}, {profile,launch:async()=>{},details:async()=>({bundle:true})})
+ await center.submit({id,name:'dsh-remote-plugin',action:'update',version:'1.0.1',confirmSelfUpdate:true,revision:(await center.inventory()).revision})
+ let attempts=0
+ await runWorker(dir,profile.cli,id,async(cli,args,cwd,output)=>{attempts++;output('[ERR_PNPM_EPERM] EPERM: operation not permitted, rename dsh-remote-plugin_tmp -> dsh-remote-plugin');throw Error('DSH 插件命令失败，退出码 1')})
+ const job=(await center.inventory()).operations[0]
+ assert.equal(job.phase,'failed');assert.equal(attempts,1);assert.match(job.message,/Windows.*拒绝/);assert.match(job.message,/旧网关|DSH.*占用/);assert.match(job.message,/不能假定.*回滚/)
+ assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'.remote-plugin-center','backup-'+id,'remote-plugin/package.json'))).version,'1.0.0')
 })

@@ -25,6 +25,7 @@ const CLIENT_ID = (() => {
     return id
   } catch { return '' }
 })()
+let doctorSessionHandoff = false
 function clientIdHeaders() { return CLIENT_ID ? { 'x-dsh-remote-client-id': CLIENT_ID } : {} }
 
 /* 按连接身份隔离：本地缓存先显示，远端历史在后台校验与合并。 */
@@ -72,6 +73,8 @@ const state = {
   announcementIndex: 0,
   announcements: [],
   approvals: [],           // 待处理审批
+  approvalRecords: new Map(), // 审批记录：审计事件(approval/asked+decided)与实时审批帧
+  approvalRecordsServer: null,
   questions: [],           // 待处理提问
   queues: {},              // sessionId -> queue items
   queueSteering: {},       // sessionId:itemId -> pending steer request
@@ -103,7 +106,7 @@ const state = {
   wbArchived: [],
   wbOpen: false,
   wbOpenProjects: {},
-  subagentExpandedSession: ''
+  subagentSessions: {}
 }
 
 // Increment on every identity transition, including A -> B -> A and token edits.
@@ -115,12 +118,13 @@ for (const key of ['server', 'token']) {
     get: () => value,
     set(next) {
       if (next === value) return
+      cancelHistoryLoad()
       value = next; connectionGeneration++
       clearTimeout(state.refreshTimer); state.refreshTimer = null
-      state.sessions = []; state.byId.clear(); state.pendingProjections.clear()
+      state.sessions = []; state.byId.clear(); state.pendingProjections.clear(); state.runtimeErrors = new Map()
       state.hostInfo = null
       if(typeof closeStream==='function'&&typeof streamMeta!=='undefined'){closeStream('mux');closeStream('host')}
-      state.current = null; state.history = emptyHistory()
+      state.current = null; state.history = emptyHistory(); state.subagentSessions = {}; window.DshSubagents?.reset()
       state.models = { loaded: false, loading: false, groups: [], current: null, failures: [] }
       state.modelSettings = { status: 'idle', error: '', writable: false, hasDocument: false, providers: [], namespaces: [], credentials: {} }; state.modelEditor = null
       state.goalEdit = null; state.goalEditContext = null
@@ -139,7 +143,7 @@ for (const key of ['server', 'token']) {
         queueMicrotask(()=>{if(identityGeneration===connectionGeneration&&typeof startOverviewDetection==='function')startOverviewDetection(true,true)})
         document.getElementById('history')?.replaceChildren?.()
         const generation=connectionGeneration
-        queueMicrotask(()=>{if(generation!==connectionGeneration)return;if(typeof conversationView!=='undefined')conversationView?.reset();restoreCachedSessionList()})
+        queueMicrotask(()=>{if(generation!==connectionGeneration)return;if(typeof conversationView!=='undefined')conversationView?.reset();if(!state.current&&document.body.classList.contains('in-session')){document.body.classList.remove('in-session');showView('view-home')};restoreCachedSessionList()})
       }
       if (typeof document !== 'undefined') {
         document.getElementById('modal-workspace')?.classList.add('hidden')
@@ -182,7 +186,9 @@ const CUSTOM_SELECT_TITLES = {
   'mobile-enter-action': 'settings.mobileEnterTitle',
   'busy-send-mode': 'settings.busySendTitle',
   'bg-interval': 'settings.bgIntervalTitle',
-  'new-session-workspace': 'workspace.select'
+  'new-session-workspace': 'workspace.select',
+  'new-session-agent-preset': 'newSession.type',
+  'workspace-agent-preset': 'newSession.type'
 }
 let customSelectCurrent = null
 
@@ -336,14 +342,54 @@ function closeFeedbackSheet() {
 function toggleFeedbackSheet() {
   $('feedback-sheet').classList.contains('hidden') ? openFeedbackSheet() : closeFeedbackSheet()
 }
-function openFeedbackModal() {
-  state.feedbackType = 'bug'
-  document.querySelectorAll('#fb-chips .fb-chip').forEach(b => b.classList.toggle('current', b.dataset.fbType === 'bug'))
-  $('fb-msg').value = ''
-  $('fb-contact').value = ''
-  $('fb-include-diagnostics').checked = false
-  $('fb-include-crashes').checked = false
-  $('fb-crash-details').open = false
+function doctorEnvironment() {
+  let report = {}
+  try { report = globalThis.DshDiagnostics?.report?.() || {} } catch {}
+  const health = activeGatewayHealth()
+  return {
+    surface: CAP?.isNativePlatform?.() ? 'Android app' : 'Mobile web',
+    appVersion: state.localVersion || report.client?.version || '',
+    gatewayVersion: health?.version || '',
+    gatewayOk: health?.ok === true,
+    gatewayReachable: health?.upstreamReachable,
+    dshVersion: state.hostInfo?.version || '',
+    host: currentServerEntry()?.note || state.server || location.origin,
+    mux: state.streamsOk?.mux ? 'connected' : state.streamMode || 'unknown',
+    hostEvents: state.streamsOk?.host ? 'connected' : state.streamMode || 'unknown',
+  }
+}
+function openDoctor() {
+  closeFeedbackSheet()
+  if (!window.DshDoctor) {
+    toast(t('feedback.submitFailed', { msg: 'doctor unavailable' }), 'err')
+    return
+  }
+  const connection=captureConnection(), accessToken=state.token
+  window.DshDoctor.open({
+    connection,
+    loadTarget:()=>window.DshDoctorEntry.loadTarget({url:apiUrl,headers:{authorization:'Bearer '+accessToken},connection}),
+    surface: 'mobile',
+    rpc: (method, payload) => rpc(method, payload),
+    openSession: async id => { await openSession(id); return connection.valid() && state.current===id && !$('view-session').classList.contains('hidden') },
+    workspaceId: () => workspaceForSession(state.byId.get(state.current))?.workspaceId || workspaceById(state.workspaceFilter)?.workspaceId || '',
+    cwd: () => sessionCwd(state.byId.get(state.current)) || '',
+    environment: doctorEnvironment,
+    diagnostics: () => globalThis.DshDiagnostics?.report?.(),
+    exportDiagnostics: () => globalThis.DshDiagnostics?.download?.(),
+    copy: copyText,
+    toast,
+  })
+}
+function openFeedbackModal(options = {}) {
+  if (!options.preserveDraft) {
+    state.feedbackType = 'bug'
+    document.querySelectorAll('#fb-chips .fb-chip').forEach(b => b.classList.toggle('current', b.dataset.fbType === 'bug'))
+    $('fb-msg').value = ''
+    $('fb-contact').value = ''
+    $('fb-include-diagnostics').checked = false
+    $('fb-include-crashes').checked = false
+    $('fb-crash-details').open = false
+  }
   void loadCrashPreview()
   $('modal-feedback').classList.remove('hidden')
   setTimeout(() => $('fb-msg').focus(), 50)
@@ -377,6 +423,7 @@ async function submitFeedback() {
   if (message.length > 2000) { toast(t('feedback.tooLong'), 'err'); return }
   const btn = $('fb-submit')
   btn.disabled = true
+  const diagnostic=globalThis.DshDiagnostics?.start('feedback.submit')
   try {
     const base = updateBase()
     if (!base) throw new Error(t('feedback.networkError'))
@@ -385,12 +432,14 @@ async function submitFeedback() {
       headers: { 'content-type': 'application/json', authorization: 'Bearer ' + state.token },
       body: JSON.stringify({ type, message, contact, appVersion: state.localVersion, includeDiagnostics, includeCrashLogs })
     })
+    diagnostic?.end({phase:res.ok?'complete':'failed',httpStatus:res.status})
     let json = {}
     try { json = await res.json() } catch {}
     if (res.ok && json.ok) { closeFeedbackModal(); openFeedbackSuccess() }
     else if (res.status === 429) { toast(json.retryAfter ? t('feedback.rateLimitedAt', { n: json.retryAfter }) : t('feedback.rateLimited'), 'err') }
     else { toast(t('feedback.submitFailed', { msg: json.error || res.status }), 'err') }
-  } catch {
+  } catch(error) {
+    diagnostic?.fail(error)
     toast(t('feedback.submitFailed', { msg: t('feedback.networkError') }), 'err')
   } finally {
     btn.disabled = false
@@ -449,25 +498,30 @@ function apiUrl(path) {
 let wsTicketPromise = null
 let wsTicketConnection = null
 async function getWsTicket() {
-  const now = Date.now()
-  if (state.wsTicket.token === state.token && state.wsTicket.server === state.server &&
-      state.wsTicket.value && state.wsTicket.expiresAt > now + 15000) return state.wsTicket.value
+  // Share only an in-flight request. A completed ticket may be exhausted or
+  // belong to the gateway instance that just exited.
   if (wsTicketPromise && wsTicketConnection?.valid()) return wsTicketPromise
   const connection = captureConnection()
   const token = state.token
   const server = state.server
   const job = (async () => {
-    if (activeGatewayCapability('wsTicket') === false) throw new Error('ws ticket unsupported')
-    const res = await fetch(apiUrl('/api/ws-ticket'), {
-      method: 'POST',
-      headers: {
-        authorization: 'Bearer ' + token,
-        'x-dsh-remote-client': CAP?.isNativePlatform?.() ? 'app' : 'web',
-        ...clientIdHeaders(),
-      }
-    })
-    if (!res.ok) throw new Error('ws ticket HTTP ' + res.status)
-    const data = await res.json()
+    if (activeGatewayCapability('wsTicket') === false) throw Object.assign(new Error('ws ticket unsupported'), { unsupported: true })
+    const read = async signal => {
+      const res = await fetch(apiUrl('/api/ws-ticket'), {
+        method: 'POST',
+        signal,
+        headers: {
+          authorization: 'Bearer ' + token,
+          'x-dsh-remote-client': CAP?.isNativePlatform?.() ? 'app' : 'web',
+          ...clientIdHeaders(),
+        }
+      })
+      if (!res.ok) throw Object.assign(new Error('ws ticket HTTP ' + res.status), { unsupported: [404, 405, 501].includes(res.status) })
+      return res.json()
+    }
+    const data = await (globalThis.DshNetwork?.readWithDeadline
+      ? globalThis.DshNetwork.readWithDeadline(read,8000)
+      : read(AbortSignal.timeout(8000)))
     if (!connection.valid()) throw new Error('stale ws ticket')
     if (!data?.ticket || !Number(data.expiresAt)) throw new Error('invalid ws ticket')
     state.wsTicket = { token, server, value: data.ticket, expiresAt: Number(data.expiresAt) }
@@ -504,27 +558,37 @@ function bucketTokens(b) {
   return (b.input || 0) + (b.cacheRead || 0) + (b.cacheWrite || 0) + (b.output || 0)
 }
 
-async function rpc(method, payload = {}, timeoutMs = 45000) {
+async function rpc(method, payload = {}, timeoutMs = 45000, cancellation = null) {
+  const diagnostic=globalThis.DshDiagnostics?.start('rpc',{method,sessionId:payload.sessionId,server:state.server})
+  try {
   const opts = {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer ' + state.token, 'x-dsh-remote-client': CAP?.isNativePlatform?.() ? 'app' : 'web', ...clientIdHeaders() },
     body: JSON.stringify({ type: 'client-request', rpcId: uuid(), method, payload })
   }
-  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+  if (cancellation) opts.signal = cancellation
+  else if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
     opts.signal = AbortSignal.timeout(timeoutMs)
   }
-  const res = await fetch(apiUrl('/api/' + method), opts)
+  const operation = window.DshOperations?.supports(method) && activeGatewayCapability('operations') === true
+  const connection = operation ? captureConnection() : null
+  const receipt = operation ? await window.DshOperations.execute({ method, payload, url: apiUrl, headers: opts.headers, valid: () => connection.valid() }) : null
+  const res = receipt ? { status: 200, ok: true, json: async () => receipt } : await fetch(apiUrl('/api/' + method), opts)
+  diagnostic?.end({phase:'response',httpStatus:res.status})
   if (res.status === 401) throw new Error('AUTH')
   if (!res.ok) throw new Error('HTTP ' + res.status)
   const full = await res.json()
   if (!full?.result) throw new Error(t('err.badResponse'))
   if (!full.result.ok) {
     const err = full.result.error || {}
-    const error = new Error(err.message || t('err.dshError'))
+    const error = new Error(err.code === 'session/migration-required' ? t('session.migrationRequired') : err.message || t('err.dshError'))
+    error.code = err.code
     error.rpcRejected = true
     throw error
   }
+  diagnostic?.end({phase:'complete'})
   return full.result.value
+  } catch(error) { diagnostic?.fail(error);throw error }
 }
 
 async function respond(rpcId, value) {
@@ -548,6 +612,7 @@ async function safeRpc(method, payload, errText) {
   catch (e) {
     if (!connection.valid()) return null
     if (e.message === 'AUTH') authFailure()
+    else if (e.operationPending) toast(e.message, 'err')
     else toast(errText ? `${errText}：${e.message}` : e.message, 'err')
     return null
   }
@@ -557,6 +622,11 @@ let hostDescribePromise = null
 let hostDescribeConnection = null
 let hostDescribeRetryTimer = null
 let hostDescribeFailures = 0
+function hostDescriptionText(host) {
+  const detail = t('settings.hostDesc', { version: host.version || t('settings.unknown'), cwd: host.cwd || t('settings.unknown'), n: Number.isSafeInteger(host.attachedSessions) ? host.attachedSessions : t('settings.unknown') })
+  const health = activeGatewayHealth()
+  return health ? detail + ' · ' + t('settings.hostHealth', { status: t(health.upstreamOk ? 'conn.on' : 'conn.off'), http: health.upstreamStatus || '—', mux: health.events?.mux?.connected ? '✓' : '×', host: health.events?.host?.connected ? '✓' : '×', time: health.upstreamCheckedAt ? new Date(health.upstreamCheckedAt).toLocaleTimeString() : '—' }) : detail
+}
 
 function scheduleHostDescribeRetry() {
   if (!state.token || hostDescribeRetryTimer) return
@@ -575,16 +645,21 @@ async function refreshHostDescription({ notify = false } = {}) {
   hostDescribeConnection = connection
   const job = (async () => {
     try {
+      if (notify) {
+        const base = String(connection.server || location.origin).replace(/\/+$/, '')
+        const response = await fetch(base + '/health?probe=fresh', { cache: 'no-store', signal: AbortSignal.timeout(6500) })
+        const health = await response.json()
+        if (!connection.valid()) return null
+        if (response.ok && health?.service === 'dsh-remote') state.gatewayHealth[base] = health
+      }
       const host = await rpc('host.describe', {}, 5000)
       if (!connection.valid()) return null
       state.hostInfo = host
-      const health = activeGatewayHealth()
-      if (health) health.upstreamReachable = true
       hostDescribeFailures = 0
       if (hostDescribeRetryTimer) clearTimeout(hostDescribeRetryTimer)
       hostDescribeRetryTimer = null
       const desc = $('host-desc')
-      if (desc && host) desc.textContent = t('settings.hostDesc', { version: host.version, cwd: host.cwd, n: host.attachedSessions })
+      if (desc && host) desc.textContent = hostDescriptionText(host)
       renderOverview()
       return host
     } catch (error) {
@@ -765,8 +840,9 @@ function activeGatewayHealth() {
 
 function dshReachable() {
   const health = activeGatewayHealth()
+  if (health && typeof health.upstreamOk === 'boolean') return health.upstreamOk
   if (health && typeof health.upstreamReachable === 'boolean') return health.upstreamReachable
-  return !!state.hostInfo
+  return !!state.hostInfo && state.hostInfo.metadataOnly !== true
 }
 
 async function selectFastestServer({ silent = false, reconnect = true } = {}) {
@@ -851,6 +927,7 @@ function renderGroupSelect() {
   const menu = $('group-select-menu')
   if (!label || !menu) return
   label.textContent = state.activeGroup
+  $('group-select-btn')?.setAttribute('aria-label', t('groups.currentLabel', { group: state.activeGroup }))
   menu.innerHTML = state.groups.map(g =>
     `<button type="button" class="group-option ${g === state.activeGroup ? 'current' : ''}" data-group-option="${esc(g)}">${esc(g)}${g === state.activeGroup ? ' ✓' : ''}</button>`).join('')
   menu.querySelectorAll('[data-group-option]').forEach(b =>
@@ -952,7 +1029,7 @@ function renderServers() {
     const activeManual = state.groupActive[g] || ''
     return `<div class="srv-group" data-group="${esc(g)}">
       <div class="srv-group-head">
-        <button class="srv-group-name" data-group-name="${esc(g)}">${g === state.activeGroup ? '▾' : '▸'} ${esc(g)} <span class="srv-group-count">${list.length}</span></button>
+        <button class="srv-group-name" data-group-name="${esc(g)}"><span class="srv-group-label">${g === state.activeGroup ? '▾' : '▸'} ${esc(g)}</span><span class="srv-group-count">${list.length}</span></button>
         <button class="srv-group-speed mini-btn" data-speed-group="${esc(g)}" title="${t('groups.speedTest')}">⚡</button>
         <label class="switch small" title="${t('groups.autoSelect')}">
           <input type="checkbox" data-auto-group="${esc(g)}" ${auto ? 'checked' : ''}>
@@ -963,14 +1040,17 @@ function renderServers() {
       <div class="srv-group-body ${g === state.activeGroup ? '' : 'hidden'}">
         ${list.map(s => {
           const ms = state.serverLatency[serverKey(s)]
-          let badge = `<span class="server-badge">${t('servers.untested')}</span>`
           const active = s.url === state.server && serverToken(s) === state.token
-          if (Number.isFinite(ms)) badge = `<span class="server-badge ${active ? 'good' : ''}">${ms}ms${active ? t('servers.current') : ''}</span>`
+          // 只显示一条最有用的状态，避免地址被状态文案挤成竖排。
+          let badge = `<span class="server-badge">${t('servers.untested')}</span>`
+          if (!s.token) badge = `<span class="server-badge bad">${t('servers.tokenMissing')}</span>`
+          else if (Number.isFinite(ms)) badge = `<span class="server-badge ${active ? 'good' : ''}">${ms}ms${active ? t('servers.current') : ''}</span>`
           else if (ms !== undefined) badge = '<span class="server-badge bad">' + t('servers.unreachable') + '</span>'
+          else if (active) badge = `<span class="server-badge good">${t('servers.currentOnly')}</span>`
           const activeInGroup = auto ? active : s.id === activeManual
           return `<div class="server-row ${activeInGroup ? 'active' : ''}" data-use-server="${esc(s.id)}">
-            <span class="server-main"><span class="server-note">${esc(serverTitle(s))}</span>${s.note ? `<span class="server-url">${esc(s.url)}</span>` : ''}<span class="server-token-badge">${s.token ? t('servers.tokenSet') : t('servers.tokenMissing')}</span></span>${badge}
-            <button class="server-edit" data-edit-server="${esc(s.id)}" title="${t('servers.edit')}">✎</button>
+            <span class="server-main"><span class="server-note" title="${esc(serverTitle(s))}">${esc(serverTitle(s))}</span>${s.note ? `<span class="server-url">${esc(s.url)}</span>` : ''}</span>${badge}
+            <button class="server-edit" data-edit-server="${esc(s.id)}" title="${t('servers.edit')}" aria-label="${t('servers.edit')}">✎</button>
             <button class="server-del" data-del-server="${esc(s.id)}" aria-label="${t('servers.delete')}">✕</button>
           </div>`
         }).join('') || '<div class="server-empty">' + t('groups.noServer') + '</div>'}
@@ -1028,7 +1108,7 @@ function renderServers() {
   const curGroup = cur ? cur.group : state.activeGroup
   const curMs = cur ? state.serverLatency[serverKey(cur)] : undefined
   $('server-desc').textContent = state.server
-    ? t('servers.currentDescGroup', { group: curGroup, url: curNote, ms: Number.isFinite(curMs) ? curMs + 'ms' : '—' })
+    ? t('servers.currentDescGroup', { group: curGroup, url: curNote }) + (Number.isFinite(curMs) ? ' · ' + curMs + 'ms' : '')
     : (CAP?.isNativePlatform?.() ? t('servers.notSet') : t('servers.defaultDesc'))
   updateConn()
 }
@@ -1248,12 +1328,25 @@ function openStreams() {
 function openStream(kind, handler, refreshOnOpen, isRestore, ticket = null) {
   if (!state.token) return
   if (ticket === null) {
-    const token = state.token, connection=captureConnection()
+    if (streams[kind] && [WebSocket.OPEN, WebSocket.CONNECTING].includes(streams[kind].readyState)) return
+    const connection=captureConnection(), generation=streamMeta[kind].generation
+    const valid=()=>connection.valid() && generation===streamMeta[kind].generation
     void getWsTicket().then((value) => {
-      if (connection.valid()) openStream(kind, handler, refreshOnOpen, isRestore, value)
-    }).catch(() => {
+      if (valid()) openStream(kind, handler, refreshOnOpen, isRestore, value)
+    }).catch((error) => {
       // 兼容旧网关/插件副本: ticket 接口不可用时临时回退旧 token 握手。
-      if (connection.valid()) openStream(kind, handler, refreshOnOpen, isRestore, '')
+      if (!valid()) return
+      if (error.unsupported) openStream(kind, handler, refreshOnOpen, isRestore, '')
+      else {
+        clearStreamRetry(kind)
+        const meta = streamMeta[kind]
+        meta.failures++
+        aggregateStreamFailures()
+        if (state.streamMode !== 'poll' && meta.failures >= 3) { enterPollMode(); return }
+        const delay = Math.round(Math.min(1500 * 2 ** Math.min(meta.attempt++, 6), 60000) * (0.8 + Math.random() * 0.4))
+        meta.retryTimer = setTimeout(() => { meta.retryTimer = null; if (valid() && navigator.onLine) openStream(kind, handler, refreshOnOpen, isRestore) }, delay)
+        setReconnect(delay)
+      }
     })
     return
   }
@@ -1286,6 +1379,7 @@ function openStream(kind, handler, refreshOnOpen, isRestore, ticket = null) {
   ws._isRestore = !!isRestore
   ws.onopen = () => {
     if (!streamIsCurrent(kind, ws, generation)) return
+    globalThis.DshDiagnostics?.record('stream.state',{channel:kind,status:'open',attempt:meta.failures})
     state.streamsOk[kind] = true
     markStreamInfo(kind, { status: 'open', lastOpenAt: Date.now(), lastCloseCode: 0, lastCloseReason: '' })
     meta.attempt = 0
@@ -1323,7 +1417,7 @@ function openStream(kind, handler, refreshOnOpen, isRestore, ticket = null) {
       handler(full)
     } catch {}
   }
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     clearStreamTimers(ws)
     if (!streamIsCurrent(kind, ws, generation)) return
     streams[kind] = null
@@ -1331,9 +1425,10 @@ function openStream(kind, handler, refreshOnOpen, isRestore, ticket = null) {
     markStreamInfo(kind, {
       status: 'closed',
       lastCloseAt: Date.now(),
-      lastCloseCode: Number(ws.code) || 0,
-      lastCloseReason: String(ws.reason || ''),
+      lastCloseCode: Number(event.code) || 0,
+      lastCloseReason: String(event.reason || '').slice(0, 200),
     })
+    globalThis.DshDiagnostics?.record('stream.state',{channel:kind,status:'closed',closeCode:Number(event.code)||0,attempt:meta.failures+1})
     meta.failures++
     aggregateStreamFailures()
     updateConn()
@@ -1346,6 +1441,7 @@ function openStream(kind, handler, refreshOnOpen, isRestore, ticket = null) {
     const attempt = meta.attempt++
     const baseDelay = Math.min(1500 * Math.pow(2, attempt), 60000)
     const delay = Math.round(baseDelay * (0.8 + Math.random() * 0.4))
+    globalThis.DshDiagnostics?.record('stream.retry',{channel:kind,attempt:meta.attempt,delayMs:delay})
     setReconnect(delay)
     clearStreamRetry(kind)
     meta.retryTimer = setTimeout(() => {
@@ -1358,6 +1454,7 @@ function openStream(kind, handler, refreshOnOpen, isRestore, ticket = null) {
 
 /* ---------------- 轮询降级模式 ---------------- */
 function enterPollMode() {
+  globalThis.DshDiagnostics?.record('poll.state',{status:'poll'})
   if (state.streamMode === 'poll') return
   state.streamMode = 'poll'
   state.pollSeq = { mux: 0, host: 0 }
@@ -1397,23 +1494,31 @@ async function pollKind(kind, cancellation) {
   const connection = captureConnection(), cursors = state.pollSeq
   const valid = () => connection.valid() && state.streamMode === 'poll' && state.pollSeq === cursors && !cancellation?.aborted
   const since = state.pollSeq[kind] || 0
-  let res
+  let res, data
   try {
-    const timeout = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(window.DshNetwork?.profile().pollTimeout || 30000) : undefined
-    const signal = cancellation && timeout && typeof AbortSignal.any === 'function' ? AbortSignal.any([cancellation, timeout]) : timeout || cancellation
+    const timeoutMs = window.DshNetwork?.profile().pollTimeout || 30000
     const headers = { authorization: 'Bearer ' + state.token, 'x-dsh-remote-client': CAP?.isNativePlatform?.() ? 'app' : 'web', ...clientIdHeaders() }
-    res = signal ? await fetch(apiUrl(`/api/events.poll?kind=${kind}&since=${since}&wait=25000`), { signal, headers }) : await fetch(apiUrl(`/api/events.poll?kind=${kind}&since=${since}&wait=25000`), { headers })
+    const read = async signal => {
+      const response = await fetch(apiUrl(`/api/events.poll?kind=${kind}&since=${since}&wait=25000&epoch=${encodeURIComponent(cursors[kind + "Epoch"] || "")}`), { ...(signal ? { signal } : {}), headers })
+      return {res:response,data:response.ok ? await response.json() : null}
+    }
+    let result
+    if(globalThis.DshNetwork?.readWithDeadline)result=await globalThis.DshNetwork.readWithDeadline(read,timeoutMs,cancellation)
+    else {
+      const timeout = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(timeoutMs) : undefined
+      const signal = cancellation && timeout && typeof AbortSignal.any === 'function' ? AbortSignal.any([cancellation, timeout]) : timeout || cancellation
+      result=await read(signal)
+    }
+    res=result.res;data=result.data
   } catch { return }
   if (!valid()) return
   if (res.status === 401) { authFailure(); return }
   if (!res.ok) return
-  let data
-  try { data = await res.json() } catch { return }
   if (!valid()) return
   if (!data || !Array.isArray(data.events)) return
   // 网关重启或客户端离线过久后，游标可能落后于内存环形缓冲；
   // 从当前缓冲重新接收，并刷新权威会话列表，避免静默漏事件。
-  const reset = data.truncated === true || (typeof data.latestSeq === 'number' && data.latestSeq < since)
+  const reset = data.reset === true || (!!data.epoch && !!cursors[kind + 'Epoch'] && cursors[kind + 'Epoch'] !== data.epoch) || data.truncated === true || (typeof data.latestSeq === 'number' && data.latestSeq < since)
   if (reset) {
     state.pollSeq[kind] = 0
     if (kind === 'mux') {
@@ -1424,6 +1529,8 @@ async function pollKind(kind, cancellation) {
     scheduleRefresh()
     if (state.current) void resyncCurrentSession()
   }
+  if (data.epoch) cursors[kind + 'Epoch'] = data.epoch
+  for (const frame of data.baseline || []) { if (kind === 'mux') onMuxFrame(frame); else onHostFrame(frame) }
   for (const item of data.events) {
     if (item.seq > (state.pollSeq[kind] || 0)) {
       state.pollSeq[kind] = item.seq
@@ -1456,6 +1563,8 @@ function onResume() {
   window.scrollTo(0, 0)
   updateConn()
   void openPendingNavigation()
+  recoverSessionHistory()
+  if(state.token)openStreams()
 }
 
 /* 回前台 / 定时兜底: 任何流不在 OPEN 就重连; 多服务器时顺便重测速 */
@@ -1471,6 +1580,7 @@ window.addEventListener('pageshow', onResume)
 setInterval(() => {
   if (document.visibilityState === 'visible' && state.token) {
     repairMissingStreams()
+    sessionSyncTick()
   }
 }, 15000)
 // 多服务器: 每 5 分钟重测一次延迟, 网络环境变化(离开 Wi-Fi / 挂上 Tailscale)时自动换线
@@ -1490,8 +1600,17 @@ window.addEventListener('online', () => {
   if (!state.token) { updateConn(); return }
   state.errCount = 0
   clearReconnect()
+  recoverSessionHistory()
   openStreams()
   updateConn()
+})
+// Connection metrics also emit change; only a network type change needs recovery.
+let networkConnectionType=navigator.connection?.type||navigator.connection?.effectiveType
+navigator.connection?.addEventListener?.('change',()=>{
+  const type=navigator.connection.type||navigator.connection.effectiveType
+  if(type===networkConnectionType)return
+  networkConnectionType=type
+  if(document.visibilityState==='visible'&&state.token){recoverSessionHistory();openStreams();if(state.servers.length)void selectFastestServer({silent:true})}
 })
 
 function onMuxFrame(full) {
@@ -1506,10 +1625,11 @@ function onMuxFrame(full) {
   if (f.type === 'approval/requested') {
     state.approvals = state.approvals.filter(a => a.approvalId !== f.approvalId)
     state.approvals.push({ ...f, rpcId: full.rpcId })
+    collectApprovalFrame(f)
     notifyPendingRequest(full, t('notify.approvalTitle'), t('notify.approvalBody', { tool: f.toolName || t('tool.unknown') }))
     renderPending(); return
   }
-  if (f.type === 'approval/resolved') { clearPendingNotification(f); state.approvals = state.approvals.filter(a => a.approvalId !== f.approvalId); renderPending(); return }
+  if (f.type === 'approval/resolved') { collectApprovalFrame(f); clearPendingNotification(f); state.approvals = state.approvals.filter(a => a.approvalId !== f.approvalId); renderPending(); return }
   if (f.type === 'question/requested') {
     state.questions = state.questions.filter(q => q.rpcId !== full.rpcId)
     state.questions.push({ ...f, rpcId: full.rpcId })
@@ -1526,6 +1646,7 @@ function onMuxFrame(full) {
   if (f.type === 'session/jobs') { state.jobs[f.sessionId] = f.jobs || []; renderJobs(); return }
   if (f.type === 'session/projection') { applyProjection(f.sessionId, f.key, f.value, f.seq); return }
   if (f.type === 'stream/error') { toast(t('stream.error', { msg: f.error?.message || '' }), 'err') }
+  if (f.type === 'session/stream-error' && f.sessionId === state.current) { setSessionRecovery('error', f.error?.code === 'session/migration-required' ? t('session.migrationRequired') : f.error?.message); toast(f.error?.code === 'session/migration-required' ? t('session.migrationRequired') : f.error?.message, 'err') }
 }
 function onHostFrame(full) {
   const f = full.payload
@@ -1534,18 +1655,22 @@ function onHostFrame(full) {
   if (f.type === 'host/session-activity') {
     const session = state.byId.get(f.sessionId)
     if (session) { session.updatedAt = Number(f.updatedAt) || Date.now(); renderSessions(); renderOverview() }
+    scheduleSessionSync(f.sessionId)
     return
   }
   if (f.type === 'host/session-status') {
+    if (f.running && state.runtimeErrors?.delete(f.sessionId) && state.current === f.sessionId) renderHistory()
     const s = state.byId.get(f.sessionId)
-    if (s) { s.running = f.running; if (state.current === f.sessionId) { renderSessionCards(); updateCancelBtn(); renderSessionSub(); updateSessionStatus() } }
+    if (s) { s.running = f.running; if (f.running) s.error = false; if (state.current === f.sessionId) { renderSessionCards(); updateCancelBtn(); renderSessionSub(); updateSessionStatus() } }
+    if (!f.running) scheduleSessionSync(f.sessionId)
     return
   }
   if (f.type === 'host/agent-error') {
     const s = state.byId.get(f.sessionId)
     if (s) { s.error = true; s.running = false }
-    if (state.current === f.sessionId) { renderSessionSub(); updateSessionStatus() }
-    return toast(t('session.errorMsg', { msg: f.message }), 'err')
+    rememberRuntimeError(f.sessionId, f.message)
+    if (state.current === f.sessionId) { renderSessionSub(); updateSessionStatus(); toast(t('session.errorMsg', { msg: f.message }), 'err') }
+    return
   }
   if (f.type === 'host/remote-event') return scheduleRefresh()
 }
@@ -1585,6 +1710,7 @@ function setCompactionStatus(sessionId, next) {
     }
     if (previous?.active && previous.notify && next?.notify !== false && ['complete', 'failed'].includes(next?.phase)) {
       const command = previous.command || 'compact'
+      if (command === 'export' && next?.phase === 'complete' && state.current === sessionId && typeof downloadSessionExport === 'function') void downloadSessionExport(sessionId)
       if (next?.phase === 'failed') toast(command === 'compact'
         ? t('session.compactFailed', { msg: next.message || t('send.failed') })
         : t('session.commandFailed', { command, msg: next.message || t('send.failed') }), 'err')
@@ -1673,10 +1799,18 @@ function onSessionEvent(sessionId, event, meta = {}) {
   const s = state.byId.get(sessionId)
   observeCompactionEvent(sessionId, event, meta)
   if (event.type === 'turn/start' || event.type === 'turn/end') {
+    if (event.type === 'turn/end' && event.data?.reason?.kind === 'error' && s) {
+      s.error = true; s.running = false
+      if (state.current === sessionId) { updateCancelBtn(); renderSessionSub(); updateSessionStatus() }
+    }
     noteSessionTurnTime(sessionId, event)
     renderSessions()
+    if (event.type === 'turn/start') state.runtimeErrors?.delete(sessionId)
+    if (event.type === 'turn/end' && !meta.replay) scheduleSessionSync(sessionId)
   }
   if (event.type === 'agent/status') {
+    if (event.data?.running) state.runtimeErrors?.delete(sessionId)
+    else if (!meta.replay) scheduleSessionSync(sessionId)
     if (s) { s.running = !!event.data?.running; s.blank = false; if (s.running) s.error = false }
     if (state.current === sessionId) { updateCancelBtn(); renderSessionSub(); updateSessionStatus() }
   }
@@ -1721,8 +1855,15 @@ async function refreshSessions() {
   }
   state.sessions = v.items || []
   state.byId = new Map(state.sessions.map(s => [s.sessionId, s]))
+  for (const [id, child] of Object.entries(state.subagentSessions || {})) {
+    const listed = state.byId.get(id)
+    const merged = listed ? { ...child, ...listed, parentSessionId: child.parentSessionId, subagentMode: child.subagentMode, origin: 'subagent' } : child
+    state.byId.set(id, merged)
+    state.subagentSessions[id] = merged
+  }
   applyPendingProjections()
   cacheWrite(CACHE.sessions, state.sessions.slice(0, 80))
+  if(typeof window!=='undefined')window.DshDoctorEntry?.consumeSessionLink(openSession,state.byId)
   renderSessions()
   refreshWorkbench()
 }
@@ -1779,9 +1920,15 @@ function hydrateSessionProjections(sessionId, projections) {
   if (!s || !projections || typeof projections !== 'object') return
   const incomingSeq = Number(projections.asOfSeq) || 0
   const current = s.projections || { asOfSeq: 0, values: {} }
+  if (projections.kind === 'cached' && current.kind === 'sequenced') return
+  if (current.kind === 'cached' || projections.kind === 'cached') {
+    s.projections = { ...projections, asOfSeq: incomingSeq, kind: projections.kind || 'sequenced', values: { ...(current.values || {}), ...(projections.values || {}) } }
+    return
+  }
   const currentSeq = Number(current.asOfSeq) || 0
   if (incomingSeq < currentSeq) return
   s.projections = {
+    kind: projections.kind || current.kind || 'sequenced',
     asOfSeq: Math.max(currentSeq, incomingSeq),
     values: { ...(current.values || {}), ...(projections.values || {}) }
   }
@@ -1802,6 +1949,7 @@ function applyProjection(sessionId, key, value, seq) {
     state.pendingProjections.set(sessionId, pending)
     return
   }
+  if (s.projections?.kind === 'cached') s.projections = { kind: 'sequenced', asOfSeq: 0, values: { ...(s.projections.values || {}) } }
   const currentSeq = Number(s.projections?.asOfSeq) || 0
   if (seq && seq < currentSeq) return
   s.projections = s.projections || { asOfSeq: 0, values: {} }
@@ -1829,6 +1977,30 @@ function resyncCurrentSession() {
     if (state.current) { renderSessionCards(); renderSessionSub(); updateCancelBtn(); updateSessionStatus() }
   })
 }
+// Coalesce activity/status signals, including signals received during a history read.
+function scheduleSessionSync(sessionId = state.current, delay = 250) {
+  if (!sessionId || sessionId !== state.current) return
+  const history = state.history, connection = captureConnection()
+  if (history.syncTimer) return
+  delay = Math.max(delay, 2000 - (Date.now() - (history.lastSyncAt || 0)))
+  history.syncTimer = setTimeout(() => {
+    history.syncTimer = null
+    if (!connection.valid() || state.current !== sessionId || state.history !== history) return
+    if (history.loading) { scheduleSessionSync(sessionId, 500); return }
+    void resyncCurrentSession().catch(() => {})
+  }, delay)
+}
+function sessionSyncTick() {
+  if (document.visibilityState === 'visible' && state.token && navigator.onLine !== false &&
+      state.current && !state.history.loading && Date.now() - (state.history.lastSyncAt || 0) >= 15000) scheduleSessionSync(state.current, 0)
+}
+function rememberRuntimeError(sessionId, message) {
+  if (!sessionId) return
+  state.runtimeErrors ||= new Map()
+  state.runtimeErrors.set(sessionId, String(message || ''))
+  if (state.runtimeErrors.size > 100) state.runtimeErrors.delete(state.runtimeErrors.keys().next().value)
+  if (sessionId === state.current) { renderHistory(); scheduleSessionSync(sessionId) }
+}
 function resyncAfterStreamOpen() {
   if (!state.current || Date.now() - state.lastStreamResyncAt < 1200) return
   state.lastStreamResyncAt = Date.now()
@@ -1847,7 +2019,8 @@ function sessionLabelOf(s) {
 }
 function short(id) { return '…' + String(id).slice(-8) }
 function isTopLevelSession(session) {
-  return !!session && !session.parentSessionId && session.origin !== 'subagent'
+  // Ordinary forks also carry parentSessionId; only explicit subagents leave the main list.
+  return !!session && session.origin !== 'subagent'
 }
 // DSH marks sessions created via "new session" but never prompted as blank and hides
 // them in its own UI; keep the same semantics here so they do not occupy the list,
@@ -2040,34 +2213,41 @@ function renderWorkspaceNavigation() {
   if ($('modal-new-session') && !$('modal-new-session').classList.contains('hidden')) renderNewSessionWorkspace()
   return items
 }
-async function refreshWorkbench() {
+async function refreshWorkbench({ discover = false } = {}) {
   const connection = captureConnection(), request = ++workbenchRequest
   const valid = () => connection.valid() && request === workbenchRequest
+  const sharedRead = (name, read) => window.DshNetwork?.shareRead ? window.DshNetwork.shareRead(JSON.stringify([connection.server, connection.token, name]), read) : read()
   if (!state.token) return
+  const workspaceRead = sharedRead('workspace.list', () => connection.valid() ? rpc('workspace.list', {}) : null).catch(() => null)
   try {
-    const res = await fetch(apiUrl('/workbench'), {
-      headers: { authorization: 'Bearer ' + state.token, 'x-dsh-remote-client': CAP?.isNativePlatform?.() ? 'app' : 'web', ...clientIdHeaders() }
+    const target = apiUrl('/workbench')
+    const res = await sharedRead('workbench', async () => {
+      if(!connection.valid())return {ok:false,value:null}
+      const response = await fetch(target, {
+        headers: { authorization: 'Bearer ' + connection.token, 'x-dsh-remote-client': CAP?.isNativePlatform?.() ? 'app' : 'web', ...clientIdHeaders() }, signal: AbortSignal.timeout(10000)
+      })
+      return { ok: response.ok, value: await response.json().catch(() => null) }
     })
     if (!valid()) return
     if (res.ok) {
-      const value = await res.json().catch(() => null)
+      const value = res.value
       if (!valid()) return
       if (value && typeof value.bound === 'boolean') state.wb = value
     }
   } catch {}
   if (!valid()) return
   try {
-    const value = await rpc('workspace.list', {})
+    const value = await workspaceRead
     if (!valid()) return
-    state.wbProjects = Array.isArray(value?.items) ? value.items : []
-    state.wbArchived = Array.isArray(value?.archivedSessionIds) ? value.archivedSessionIds : []
+    if (value) state.wbProjects = Array.isArray(value.items) ? value.items : []
+    if (value) state.wbArchived = Array.isArray(value.archivedSessionIds) ? value.archivedSessionIds : []
   } catch {
     if (!valid()) return
     state.wbProjects = []
     state.wbArchived = []
   }
   // 以磁盘实际目录为准同步工作台项目：删除目录后不再残留，新增子目录自动收纳。
-  if (state.wb?.bound && state.wb.path) {
+  if (discover && state.wb?.bound && state.wb.path) {
     try {
       const listRes = await fetch(fsApiUrl('/list', { path: state.wb.path }), { headers: fsHeaders() })
       if (!valid()) return
@@ -2131,7 +2311,7 @@ function renderWorkbench() {
     const open = !!state.wbOpenProjects[id]
     const sessions = orderedWorkspaceSessions(id, (w.sessionIds || []).map(sid => state.byId.get(sid)).filter(isVisibleSession).filter(s => !archivedSet.has(s.sessionId)))
     const body = open ? `<div class="wb-sessions">${sessions.length ? sessions.map(s => `
-      <div class="session-swipe" data-session-swipe data-id="${esc(s.sessionId)}">
+      <div class="session-swipe" data-session-swipe data-id="${esc(s.sessionId)}" role="button" tabindex="0" aria-label="${esc(sessionLabelOf(s))}">
         <button class="wb-session" type="button" data-wb-session="${esc(s.sessionId)}" data-motion-key="${esc(s.sessionId)}">
           <span class="wb-session-drag-handle" data-reorder-handle aria-hidden="true">⠿</span>
           <span class="wb-session-title">${esc(sessionLabelOf(s))}</span>
@@ -2236,7 +2416,7 @@ function renderSessions() {
       const badge = goal ? `<span class="sc-badge ${goal.phase === 'active' ? 'goal-active' : ''}">${esc(t('sessions.goalBadge', { phase: goal.phase || '?' }))}</span>` : ''
       const queueBadge = queueN ? `<span class="sc-badge">${esc(t('sessions.queueBadge', { n: queueN }))}</span>` : ''
       const archiveButton = archivedSet.has(s.sessionId) ? '' : `<button type="button" class="sc-archive-btn" data-archive-session="${esc(s.sessionId)}">${esc(t('session.archive'))}</button>`
-      return `<div class="session-swipe" data-session-swipe data-id="${esc(s.sessionId)}">
+      return `<div class="session-swipe" data-session-swipe data-id="${esc(s.sessionId)}" role="button" tabindex="0" aria-label="${esc(sessionLabelOf(s))}">
         <div class="session-card ${state.current === s.sessionId ? 'current' : ''}">
         <div class="sc-title">${esc(title)}</div>
         <div class="sc-meta">
@@ -2303,6 +2483,7 @@ const emptySessionCleanup = new Set()
 async function archiveEmptySessionOnLeave(sessionId, leaving = false) {
   const base = state.server, connection=captureConnection()
   const protectedSession = () => !connection.valid() || state.server !== base || (!leaving && state.current !== sessionId)
+    || !!state.byId.get(sessionId)?.parentSessionId || state.byId.get(sessionId)?.origin === 'subagent'
     || !state.byId.has(sessionId) || state.byId.get(sessionId)?.running
     || state.sessionActivity?.has(sessionId) || state.pendingPrompts?.has(sessionId)
     || (state.queues[sessionId] || []).length > 0
@@ -2323,7 +2504,9 @@ async function archiveEmptySessionOnLeave(sessionId, leaving = false) {
 }
 
 async function openSession(id) {
+  globalThis.DshDiagnostics?.record('session.open',{phase:'start',sessionId:id,server:state.server})
   if (state.current && state.current !== id) void archiveEmptySessionOnLeave(state.current,true)
+  cancelHistoryLoad()
   state.current = id
   setSessionRecovery('loading')
   state.history = emptyHistory()
@@ -2334,12 +2517,20 @@ async function openSession(id) {
   $('btn-archive-session').classList.toggle('hidden', (state.wbArchived || []).includes(id))
   $('session-cards').innerHTML = ''
   renderSessionTitle(); renderSessionSub(); updateCancelBtn(); updateSessionStatus()
+  renderSessionCards()
   $('history').innerHTML = '<div class="empty">' + t('history.loading') + '</div>'
   renderQueue()
   renderSessionPending()
   void refreshCompactionStatus(id)
   getConversationView().reset()
-  await restoreCachedHistory()
+  try { const restored=await restoreCachedHistory();globalThis.DshDiagnostics?.record('history.cache',{phase:restored?'hit':'miss',sessionId:id}) } catch(error) {
+    globalThis.DshDiagnostics?.record('history.cache',{phase:'failed',sessionId:id,...globalThis.DshDiagnostics.errorFacts(error)})
+    if(state.current!==id||state.history!==openingHistory||!openingConnection.valid())return
+    // A broken local cache must not prevent fetching the authoritative history.
+    cancelHistoryLoad()
+    Object.assign(openingHistory,emptyHistory())
+    getConversationView().reset()
+  }
   if(state.current!==id||state.history!==openingHistory||!openingConnection.valid())return
   await loadHistory(true)
   renderSessionCards()
@@ -2353,42 +2544,44 @@ function sessionHasPendingActivity(sessionId, session) {
     || (state.queues[sessionId] || []).some(item => item?.placement !== 'context')
 }
 
-async function shouldDiscardEmptySession(sessionId) {
+function shouldDiscardEmptySession(sessionId) {
   const session = state.byId.get(sessionId)
   if (!session || sessionHasPendingActivity(sessionId, session)) return false
-  const deadline = Date.now() + 3500
-  while (state.current === sessionId && state.history.loading && Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 25))
-  }
-  if (state.current !== sessionId || sessionHasPendingActivity(sessionId, session)) return false
-  return isEmptySessionHistory(state.history)
+  return state.current === sessionId && !state.history.loading && !state.history.renderError
+    && !(state.composerImages || []).length && !$('composer-input')?.value?.trim()
+    && isEmptySessionHistory(state.history)
 }
 
 async function closeSession() {
-  if (closeSession.pending) return closeSession.pending
+  globalThis.DshDiagnostics?.record('session.back',{phase:'start',sessionId:state.current,loading:state.history.loading,loaded:state.history.loaded,renderErrors:state.history.renderError?1:0})
   const sessionId = state.current
-  if (!sessionId) return
-  const task = (async () => {
-    const discard = await shouldDiscardEmptySession(sessionId) && await archiveEmptySessionOnLeave(sessionId)
-    if (state.current !== sessionId) return
-    state.current = null
-    renderSessionPending()
-    if (discard) removeLocalSessionRecord(sessionId)
-    setComposerFullscreen(false)
-    clearComposerImages()
-    setSessionRecovery('idle')
-    $('btn-rename-session').classList.add('hidden')
-    $('btn-archive-session').classList.add('hidden')
-    state.history = emptyHistory()
-    document.body.classList.remove('in-session')
-    hideComposerMenu()
-    renderSessions()
-    renderWorkbench()
-    showView('view-home')
-  })()
-  closeSession.pending = task
-  try { await task } finally {
-    if (closeSession.pending === task) closeSession.pending = null
+  const parentId = state.byId.get(sessionId)?.parentSessionId
+  if (parentId && parentId !== sessionId) {
+    setComposerFullscreen(false);clearComposerImages();hideComposerMenu()
+    return openSession(parentId)
+  }
+  const wasLoading = state.history.loading
+  cancelHistoryLoad()
+  const connection=captureConnection(),discard=!wasLoading&&shouldDiscardEmptySession(sessionId)
+  state.current = null
+  state.history = emptyHistory()
+  document.body.classList.remove('in-session')
+  showView('view-home')
+  globalThis.DshDiagnostics?.record('session.back',{phase:'navigate',sessionId})
+  renderSessionPending()
+  setComposerFullscreen(false)
+  clearComposerImages()
+  setSessionRecovery('idle')
+  $('btn-rename-session').classList.add('hidden')
+  $('btn-archive-session').classList.add('hidden')
+  hideComposerMenu()
+  renderSessions()
+  renderWorkbench()
+  // Navigation must never wait for history reads or archive RPCs. A later session
+  // owns its own navigation even while this best-effort cleanup is still pending.
+  if(discard && await archiveEmptySessionOnLeave(sessionId,true) && connection.valid()) {
+    removeLocalSessionRecord(sessionId)
+    renderSessions();renderWorkbench()
   }
 }
 
@@ -2396,16 +2589,28 @@ async function closeSession() {
 function bindNativeBack() {
   if (!CAP?.isNativePlatform?.()) return
   try {
+    CAP.Plugins?.App?.addListener?.('appStateChange',({isActive})=>{if(isActive)onResume()})
     CAP.Plugins?.App?.addListener?.('backButton', () => {
       if ($('composer-wrap')?.classList.contains('fs')) { setComposerFullscreen(false); return }
       if (customSelectCurrent) { closeCustomSelect(); return }
+      if (groupDrawerOpen()) { closeGroupDrawer(); return }
+      if (typeof window !== 'undefined' && window.DshImagePreview?.isOpen?.()) { window.DshImagePreview.close(); return }
+      const dialog = document.querySelector('dialog[open]')
+      if (dialog) { dialog.close(); return }
       const openModal = [...document.querySelectorAll('.modal')].find(m => !m.classList.contains('hidden'))
       if (openModal) { if (openModal.id === 'modal-notes') closeNotesModal(); else if (openModal.id === 'modal-archive') closeArchiveConfirm(); else if (openModal.id === 'modal-rename') closeRenameSession(); else if (openModal.id === 'modal-app-version-warning') closeAppVersionWarning(false); else if (openModal.id === 'modal-scan-live') closeLiveScan(''); else openModal.classList.add('hidden'); return }   // 先关弹窗
+      if (!$('view-settings').classList.contains('hidden')) {
+        if ($('settings-home').classList.contains('hidden')) showSettingsHome()
+        else showView('view-home')
+        return
+      }
+      if (!$('view-plugins').classList.contains('hidden')) { showView('view-settings'); return }
       if (document.body.classList.contains('in-session')) { void closeSession(); return } // 会话页 → 回主页
       if (!$('view-files').classList.contains('hidden')) {           // 文件页 → 上级目录 → 主页
         if (state.fs.path && state.fs.initial && state.fs.path !== state.fs.initial) { fsUp(); return }
         showView('view-home'); return
       }
+      if ($('view-home').classList.contains('hidden')) { showView('view-home'); return }
       try { CAP.Plugins?.App?.exitApp?.() } catch {}                  // 主页再返回 → 退出(与系统一致)
     })
   } catch {}
@@ -2530,20 +2735,22 @@ function applyReasoningStreamEvent(event) {
 }
 
 let reasoningRenderTimer = null
+function weakStreamTrim() { return !!window.DshNetwork?.streamTrimmed?.() }
 function scheduleReasoningRender() {
   if (reasoningRenderTimer) return
   reasoningRenderTimer = setTimeout(() => {
     reasoningRenderTimer = null
     if (!state.current) return
     renderHistory(false, 'fixed')
-  }, 80)
+  }, weakStreamTrim() ? 500 : 80)
 }
 
 function partialReasoningHtml() {
+  if (weakStreamTrim()) return state.history.partialReasoning.size ? window.DshActivity?.streamNotice?.() || '' : ''
   return [...state.history.partialReasoning.values()]
     .filter(item => item.text)
     .sort((a, b) => (a.turn ?? 0) - (b.turn ?? 0) || (a.step ?? 0) - (b.step ?? 0) || (a.index ?? 0) - (b.index ?? 0))
-    .map(item => `<div class="msg assistant reasoning-live"><div class="role">${esc(t('role.dsh'))}</div><details class="tool" open><summary>${esc(t('block.thinkingLive'))}</summary><div class="tool-text">${esc(truncate(item.text, 12000))}</div></details></div>`)
+    .map(item => window.DshActivity ? window.DshActivity.reasoning({text:item.text,live:true,key:window.DshActivity.reasoningKey(item,item.index,'live-reasoning')}) : `<div class="msg assistant reasoning-live"><div class="role">${esc(t('role.dsh'))}</div><details class="tool" open><summary>${esc(t('block.thinkingLive'))}</summary><div class="tool-text">${esc(truncate(item.text, 12000))}</div></details></div>`)
     .join('')
 }
 
@@ -2558,13 +2765,15 @@ function historyCacheScope() { return CACHE.history }
 function historySource(value) {
   state.history.source=value
   const el=$('history-source')
-  if(el)el.textContent=t(({cache:'history.cached',syncing:'history.syncing',synced:'history.synced',saved:'history.saved',offline:'history.offline',saveFailed:'history.cacheFailed'})[value]||'history.synced')
+  if(el)el.textContent=t(({cache:'history.cached',syncing:'history.syncing',synced:'history.synced',saved:'history.saved',offline:'history.offline',saveFailed:'history.cacheFailed',error:'history.renderFailed'})[value]||'history.synced')
 }
 function getConversationView() {
   if(!conversationView)conversationView=new window.DshHistory.HistoryView($('history'),{
     html:entry=>eventHtml(entry, {toolNames:state.history.toolNames}),
+    errorLabel:()=>t('history.renderFailed'),
     older:()=>loadHistory(false),olderLabel:()=>t('history.earlier'),loadingLabel:()=>t('history.loadingEarlier'),live:partialReasoningHtml,
-    changed:view=>{state.history.renderStart=view.start;state.history.renderEnd=view.end;$('btn-history-latest')?.classList.toggle('hidden',!view.reading&&view.end>=view.entries.length&&!state.history.tailEvicted);const latest=$('btn-history-latest');if(latest)latest.textContent=t('history.latest')+(view.unread?' ('+view.unread+')':view.hasPending?' · '+(I18N.lang==='en'?'New content':'有新内容'):'');updateRail(view.domChanged)},
+    retry:()=>loadHistory(true),retryLabel:()=>t('history.retry'),unreadableLabel:()=>I18N.lang==='en'?'No displayable messages on this page. Load earlier records or retry. If DSH reports a migration failure, open the original session in DSH.':'本页历史没有可显示的消息，请加载更早记录或重试。如提示格式迁移失败，请先在 DSH 中打开原会话。',
+    changed:view=>{state.history.renderStart=view.start;state.history.renderEnd=view.end;const latest=$('btn-history-latest');if(latest){latest.classList.toggle('hidden',view.atBottom&&view.unread===0&&!state.history.tailEvicted);latest.textContent=t('history.latest')+(view.unread?' ('+view.unread+')':view.hasPending?' · '+(I18N.lang==='en'?'New content':'有新内容'):'')}updateRail(view.domChanged)},
     scrolled:()=>{updateRail()}
   })
   return conversationView
@@ -2584,7 +2793,7 @@ async function restoreCachedHistory() {
   const connection=captureConnection(),id=state.current,history=state.history,scope=historyCacheScope()
   if(!id)return false
   const cached=await window.DshHistory.cacheLoad(scope,id,legacyId=>window.DshHistory.decodeLegacy(LS.get(scope,''),legacyId))
-  if(!connection.valid()||state.current!==id||state.history!==history||!cached?.events?.length)return false
+  if(!connection.valid()||state.current!==id||state.history!==history||(history.loaded&&!history.cached)||!cached?.events?.length)return false
   history.visible=cached.events.slice(-250).filter(entry=>entry?.seq!=null&&shouldShowEvent(entry.event?.type,entry.event)).sort((a,b)=>a.seq-b.seq)
   history.seqs=new Set(history.visible.map(entry=>entry.seq));history.loaded=true;history.cached=true;history.hasMore=cached.events.length>250||cached.hasMore!==false;history.minSeq=cached.events.length>250?(history.visible[0]?.seq??Infinity):Number.isFinite(cached.minSeq)?cached.minSeq:history.visible[0]?.seq??Infinity
   if(cached.title&&!hasSessionTitle(state.byId.get(id)))hydrateSessionProjections(id,{values:{title:cached.title},asOfSeq:0})
@@ -2601,54 +2810,93 @@ function trimVisible(direction='tail') {
   else{h.minSeq=h.visible[0]?.seq??Infinity;h.headEvicted=true;h.hasMore=true}
 }
 
+function cancelHistoryLoad() {
+  const history=state.history
+  if(!history)return
+  const controller=history.loadController
+  history.loadController=null
+  history.loading=false
+  controller?.abort()
+  clearTimeout(history.syncTimer);history.syncTimer=null
+}
+function recoverSessionHistory() {
+  cancelHistoryLoad()
+  scheduleSessionSync()
+}
 async function loadHistory(reset = true) {
   const connection=captureConnection(),id=state.current,history=state.history
   if(!id||history.loading||(!reset&&Date.now()<(history.retryAfter||0)))return
+  const diagnostic=globalThis.DshDiagnostics?.start('history.load',{sessionId:id,server:state.server,reset,cached:!!history.cached,count:history.visible.length})
   const reasoningVersion=history.reasoningVersion||0,hadContent=history.visible.length>0
+  const controller=new AbortController()
+  history.loadController=controller
+  const valid=()=>connection.valid()&&state.current===id&&state.history===history&&history.loadController===controller
   history.loading=true
-  if(reset){if(hadContent)historySource('syncing');else setSessionRecovery('loading')}
-  const network=window.DshNetwork?.profile() || {historyPageSize:60,readTimeout:45000}
-  const payload={sessionId:id,maxMessages:network.historyPageSize}
-  if(!reset&&Number.isFinite(history.minSeq))payload.beforeSeq=history.minSeq
-  getConversationView().more.disabled=true
-  getConversationView().more.textContent=getConversationView().options.loadingLabel()
+  history.lastSyncAt=Date.now()
   let v
-  try{v=await rpc('session.history',payload,network.readTimeout)}catch(error){
-    if(!connection.valid()||state.current!==id||state.history!==history)return
+  // Contain preparation and final DOM failures as well as network errors. Reset
+  // the view before replacing its DOM so an identical retry cannot reuse stale nodes.
+  const failLoad = (error,renderFailure=false) => {
+    diagnostic?.fail(error)
     history.loading=false;history.retryAfter=Date.now()+1500
     if(error.message==='AUTH'){authFailure();return}
-    if(hadContent){historySource('offline');setSessionRecovery('cached',error.message);renderHistory(false,'fixed');return}
+    if(history.visible.length&&!renderFailure){try{renderHistory(false,'fixed');history.renderError=!!getConversationView().renderErrors;historySource(history.renderError?'error':'offline');setSessionRecovery(history.renderError?'error':'cached',error.message);return}catch{}}
+    history.renderError=true;historySource('error')
     setSessionRecovery('error',error.message)
+    getConversationView().reset?.()
     $('history').innerHTML='<div class="history-empty">'+esc(error.message)+'</div>'
     const retry=document.createElement('button');retry.type='button';retry.className='history-page-control';retry.textContent=t('history.retry');retry.addEventListener('click',()=>{void loadHistory(true)});$('history').append(retry)
-    return
   }
-  if(!connection.valid()||state.current!==id||state.history!==history)return
-  const liveReasoning=(history.reasoningVersion||0)!==reasoningVersion?new Map(history.partialReasoning):null
-  hydrateSessionProjections(id,v.projections);history.loaded=true
-  const incoming=v.events||[],prepared=[]
-  for (const entry of incoming) {
-    const ev=entry?.event
-    applyReasoningStreamEvent(ev)
-    if(ev?.type==='turn/start'||ev?.type==='turn/end')noteSessionTurnTime(id,ev)
-    if(ev?.seq==null||!shouldShowEvent(ev.type,ev))continue
-    prepared.push({seq:ev.seq,event:ev,view:entry.view})
-  }
-  const rawSeqs=incoming.map(entry=>entry?.event?.seq).filter(Number.isFinite),floor=rawSeqs.length?Math.min(...rawSeqs):Infinity
-  if(reset){const retainedOlder=!!v.hasMore&&history.visible.some(entry=>entry.seq<floor);const ceiling=rawSeqs.length?Math.max(...rawSeqs)+1:Infinity;history.visible=rawSeqs.length?window.DshHistory.reconcile(history.visible,prepared,floor,!!v.hasMore,ceiling):[];history.minSeq=retainedOlder?Math.min(history.minSeq,floor):floor;history.tailEvicted=false}
-  else{history.visible=window.DshHistory.reconcile(history.visible,prepared,floor,true,payload.beforeSeq);history.minSeq=Math.min(history.minSeq,floor)}
-  history.seqs=new Set(history.visible.map(entry=>entry.seq));history.headEvicted=false;trimVisible(reset?'tail':'older')
-  if(liveReasoning)history.partialReasoning=liveReasoning;else applyReasoningBaseline(v.partialReasoning)
-  history.hasMore=(!!v.hasMore||(reset&&history.headEvicted)) && rawSeqs.length>0 && (reset || floor<payload.beforeSeq)
-  history.loading=false;history.cached=false;historySource('synced');setSessionRecovery('ready')
-  renderSessionTitle();renderSessionSub();renderSessionCards()
-  renderHistory(!hadContent,reset?'fixed':'keep')
-  $('history-hint').textContent=t('history.count',{n:history.visible.length})
-  scheduleHistoryCacheSave()
+  try {
+    if(reset){if(hadContent)historySource('syncing');else setSessionRecovery('loading')}
+    const network=window.DshNetwork?.profile() || {historyPageSize:60,readTimeout:45000}
+    const payload={sessionId:id,maxMessages:network.historyPageSize}
+    const child=state.subagentSessions?.[id] || state.byId.get(id)
+    if(child?.origin==='subagent' && child.parentSessionId) Object.assign(payload,{parentSessionId:child.parentSessionId,subagentMode:child.subagentMode || 'unknown'})
+    if(!reset&&Number.isFinite(history.minSeq))payload.beforeSeq=history.minSeq
+    getConversationView().more.disabled=true
+    getConversationView().more.textContent=getConversationView().options.loadingLabel()
+    v=await window.DshNetwork.readWithDeadline(signal=>rpc('session.history',payload,network.readTimeout,signal),network.readTimeout,controller.signal);globalThis.DshDiagnostics?.record('history.load',{phase:'response',traceId:diagnostic?.traceId,sessionId:id,rawCount:Array.isArray(v?.events)?v.events.length:0})
+    if(!valid())return
+    let liveReasoning, rawSeqs, floor
+    liveReasoning=(history.reasoningVersion||0)!==reasoningVersion?new Map(history.partialReasoning):null
+    hydrateSessionProjections(id,v.projections);history.loaded=true
+    const incoming=v.events||[],prepared=[]
+    let approvalChanged=false
+    for (const entry of incoming) {
+      const ev=entry?.event
+      applyReasoningStreamEvent(ev)
+      if(ev?.type==='turn/start'||ev?.type==='turn/end')noteSessionTurnTime(id,ev)
+      if(collectApprovalEvent(id,ev))approvalChanged=true
+      if(ev?.seq==null||!shouldShowEvent(ev.type,ev))continue
+      prepared.push({seq:ev.seq,event:ev,view:entry.view})
+    }
+    rawSeqs=incoming.map(entry=>entry?.event?.seq).filter(Number.isFinite);floor=rawSeqs.length?Math.min(...rawSeqs):Infinity
+    if(reset){const retainedOlder=!!v.hasMore&&history.visible.some(entry=>entry.seq<floor);const ceiling=rawSeqs.length?Math.max(...rawSeqs)+1:Infinity;history.visible=rawSeqs.length?window.DshHistory.reconcile(history.visible,prepared,floor,!!v.hasMore,ceiling):[];history.minSeq=retainedOlder?Math.min(history.minSeq,floor):floor;history.tailEvicted=false}
+    else{history.visible=window.DshHistory.reconcile(history.visible,prepared,floor,true,payload.beforeSeq);history.minSeq=Math.min(history.minSeq,floor)}
+    history.seqs=new Set(history.visible.map(entry=>entry.seq));history.headEvicted=false;trimVisible(reset?'tail':'older')
+    if(liveReasoning)history.partialReasoning=liveReasoning;else applyReasoningBaseline(v.partialReasoning)
+    history.hasMore=(!!v.hasMore||(reset&&history.headEvicted)) && rawSeqs.length>0 && (reset || floor<payload.beforeSeq)
+    try {
+      history.loading=false;history.cached=false
+      renderSessionTitle();renderSessionSub();renderSessionCards()
+      globalThis.DshDiagnostics?.record('history.render',{phase:'start',traceId:diagnostic?.traceId,sessionId:id,count:history.visible.length})
+      renderHistory(!hadContent,reset?'fixed':'keep')
+      history.renderError=!!getConversationView().renderErrors
+      historySource(history.renderError?'error':'synced');setSessionRecovery(history.renderError?'error':'ready')
+      if(approvalChanged)renderApprovalRecords()
+      $('history-hint').textContent=t('history.count',{n:history.visible.filter(entry=>!['turn/start','turn/end'].includes(entry.event?.type)).length})
+      diagnostic?.end({phase:history.renderError?'failed':'rendered',count:history.visible.length,renderedCount:getConversationView().end-getConversationView().start,renderErrors:getConversationView().renderErrors||0})
+      if(!history.renderError)scheduleHistoryCacheSave()
+    } catch(error) { failLoad(error,true) }
+  } catch(error) { if(valid())failLoad(error) }
+  finally { if(history.loadController===controller){history.loading=false;history.loadController=null} }
 }
 
 function insertLiveEvent(event) {
   const h = state.history
+  const approvalChanged = collectApprovalEvent(state.current, event)
+  if (approvalChanged) renderApprovalRecords()
   const reasoningChanged = applyReasoningStreamEvent(event)
   if (event?.type === 'assistant/chunk' || event?.type === 'reasoning-chunks') {
     if (reasoningChanged) scheduleReasoningRender()
@@ -2668,6 +2916,19 @@ function insertLiveEvent(event) {
 
 function isToolEvent(type) { return type === 'tool/call' || type === 'tool/result' }
 
+/** One collapsed row for a turn's tools and reasoning, matching the desktop conversation rhythm. */
+function activityGroupHtml(group, ctx) {
+  const items = group.items || []
+  if (!items.length) return ''
+  const tools = items.filter(item => item.kind === 'tool').map(item => item.entry)
+  const running = !!group.running
+  const failed = tools.some(entry => entry.view?.toolActivity?.error || entry.event?.data?.error)
+  const body = items.map(item => item.kind === 'reasoning'
+    ? window.DshActivity.reasoning({ text: item.text, key: item.key })
+    : eventHtml(item.entry, ctx)).join('')
+  return `<details class="chat-activity-group${failed ? ' is-error' : ''}${running ? ' is-running' : ''}" data-activity-key="activity-group:${items[0]?.seq ?? ''}"><summary><span class="activity-group-title">${esc(t('activity.group', { n: items.length }))}</span>${running ? `<span class="activity-group-live"><i aria-hidden="true"></i>${esc(t('activity.groupRunning'))}</span>` : ''}<span class="activity-chevron" aria-hidden="true"></span></summary><div class="activity-group-body">${body}</div></details>`
+}
+
 function filteredEntries() {
   const showTools = LS.get('showTools', '1') !== '0'
   const f = state.history.visible.filter(e => showTools || !isToolEvent(e.event?.type))
@@ -2675,13 +2936,66 @@ function filteredEntries() {
   return f
 }
 
+function canForkTurnResult() {
+  const session = state.byId.get(state.current)
+  return !!session && session.origin !== 'subagent' && session.formatStatus !== 'migration-required' && activeGatewayCapability('operations') === true
+}
+function bindTurnResultActions() {
+  window.DshTurnResults.bind($('history'), {
+    capture: () => {
+      const connection = captureConnection(), sessionId = state.current, history = state.history
+      return { sessionId, entries: history.visible, key: JSON.stringify([connection.server, connection.token]), canFork: canForkTurnResult(),
+        valid: () => connection.valid() && state.current === sessionId && state.history === history }
+    },
+    copy: copyText,
+    fork: payload => rpc('session.fork', payload),
+    open: async (id, context) => {
+      const parent = state.byId.get(context.sessionId)
+      if (!context.valid()) return
+      // The fork already returned a confirmed ID. Do not wait for a catalog
+      // read before opening it: a reconnecting host can leave that read pending.
+      if (!state.byId.has(id)) {
+        const branch = { ...parent, projections: parent?.projections ? JSON.parse(JSON.stringify(parent.projections)) : undefined,
+          sessionId: id, parentSessionId: context.sessionId, origin: 'fork', running: false, blank: false }
+        state.byId.set(id, branch)
+        state.sessions.unshift(branch)
+        renderSessions()
+      }
+      await openSession(id)
+    }
+  })
+}
+
 function renderHistory(reset=false,mode='auto') {
   const filtered=filteredEntries(),toolNames=new Map()
   for(const entry of state.history.visible){const d=entry.event?.data;if(entry.event?.type==='tool/call'&&d?.callId&&d.name)toolNames.set(d.callId,d.name)}
   state.history.toolNames=toolNames
-  $('history-hint').textContent=t('history.count',{n:state.history.visible.length})
-  getConversationView().set(filtered,{reset,follow:mode==='bottom',live:partialReasoningHtml(),hasMore:state.history.hasMore,loading:state.history.loading,emptyLabel:t('history.empty')})
+  $('history-hint').textContent=t('history.count',{n:state.history.visible.filter(entry=>!['turn/start','turn/end'].includes(entry.event?.type)).length})
+  let prepared=window.DshActivity?.prepare(filtered)||filtered
+  // 弱网精简：尚未返回的调用在完成前不展示，只留已完成的消息与工具结果。
+  if(weakStreamTrim())prepared=prepared.filter(entry=>entry.event?.type!=='tool/call'||entry.view?.toolActivity)
+  // DSH 0.2.1 also embeds tool blocks in messages; the separated events own the grouped rows.
+  state.history.suppressBlockTools = state.history.visible.some(entry => entry.event?.type === 'tool/call')
+  if(window.DshActivity?.group)prepared=window.DshActivity.group(prepared)
+  // Running is a property of the session's current turn, not of an unpaired call:
+  // a finished turn may keep an unmatched call after an interrupt, and the model may be
+  // thinking between tools while the last group is still the active one.
+  const sessionRunning = !!state.byId.get(state.current)?.running
+  const groups = prepared.filter(entry => entry.view?.activityGroup)
+  const activeGroup = groups.at(-1)
+  if (activeGroup) activeGroup.view.activityGroup.running = sessionRunning
+  if (window.DshTurnResults) {
+    prepared = window.DshTurnResults.decorate(prepared, state.history.visible, { sessionId: state.current, canFork: canForkTurnResult() })
+    bindTurnResultActions()
+  }
+  if(window.DshActivity?.groupFailures)prepared=window.DshActivity.groupFailures(prepared)
+  const hostError = state.runtimeErrors?.get(state.current)
+  const recordedError = state.history.visible.some(entry => window.DshActivity?.failure?.(entry.event)?.message === hostError)
+  const runtimeHtml = hostError && !recordedError ? window.DshActivity?.failureHtml?.(hostError) || '' : ''
+  getConversationView().set(prepared,{reset,follow:mode==='bottom',live:partialReasoningHtml()+runtimeHtml,hasMore:state.history.hasMore,loading:state.history.loading,emptyLabel:t('history.empty')})
+  window.DshImagePreview?.hydrate?.($('history'))
 }
+window.applyStreamPreference=()=>{if(state.current)renderHistory(false,'auto')}
 
 /* 右侧导航条: 用户发言节点 + 拖动快速定位 */
 let historyRailLayout=null
@@ -2736,7 +3050,8 @@ function bindRail() {
 
 /* 事件 → HTML */
 const INTERESTING_EVENTS = new Set([
-  'user/message', 'assistant/message',
+  'turn/start', 'turn/end',
+  'user/message', 'assistant/message', 'assistant/attempt',
   'tool/call', 'tool/result',
   'agent/status',
   'checkpoint/created', 'compaction/complete', 'compaction/summary',
@@ -2772,11 +3087,19 @@ function systemReminderText(blocks) {
     .join('\n')
 }
 function eventHtml(entry, ctx = {}) {
+  if (entry.view?.failureGroup) return window.DshActivity.failureGroupHtml(entry.view.failureGroup, item => eventHtml(item, ctx))
   const seq = entry.seq
   const ev = entry.event || {}
   const data = ev.data || {}
   const type = ev.type || 'event'
+  const failure = window.DshActivity?.failureHtml?.(window.DshActivity.failure(ev)) || ''
+  if (entry.view?.turnResult) return failure + window.DshTurnResults.html(entry.view.turnResult)
+  // Successful boundaries stay quiet; failed turns keep their durable explanation.
+  if (type === 'turn/start' || type === 'turn/end') return failure
+  if (type === 'assistant/attempt') return window.DshActivity?.attemptHtml?.(ev) || ''
+  if (entry.view?.activityGroup) return activityGroupHtml(entry.view.activityGroup, ctx)
   if (!shouldShowEvent(type, ev)) return ''
+  if (window.DshActivity && isToolEvent(type)) return window.DshActivity.toolEvent(entry)
   let inner = ''
 
   if (type === 'user/message' || type === 'assistant/message') {
@@ -2789,7 +3112,11 @@ function eventHtml(entry, ctx = {}) {
     } else if (type === 'user/message' && !isHumanUserMessage(ev)) {
       return ''
     } else {
-      inner = `<div class="msg ${esc(role)}" data-seq="${seq}"><div class="role">${esc(role === 'user' ? t('role.me') : t('role.dsh'))}</div>${blocks.map(blockHtml).join('')}</div>`
+      const body = blocks.map((block,index)=>blockHtml(block,index,{...data,seq,suppressBlockTools:state.history.suppressBlockTools})).join('')
+      // Inline tool blocks duplicate the separated tool events; when those events exist the
+      // calls live in the activity group, so an assistant message with nothing else disappears.
+      if (!body) return ''
+      inner = `<div class="msg ${esc(role)}" data-seq="${seq}"><div class="role">${esc(role === 'user' ? t('role.me') : t('role.dsh'))}</div>${body}</div>`
     }
   } else if (type === 'tool/call') {
     const name = data.name || data.toolName || t('tool.default')
@@ -2800,6 +3127,10 @@ function eventHtml(entry, ctx = {}) {
     const name = (callId && ctx.toolNames?.get(callId)) || t('tool.result')
     const err = data.error || data.ok === false
     inner = `<details class="tool result ${err ? 'error' : ''}" data-seq="${seq}"><summary>📦 ${esc(name)}<span class="tool-meta-inline">${t('tool.result')}</span></summary><pre>${esc(truncate(safeJson(data.result ?? data.output ?? data.message ?? data), 4000))}</pre></details>`
+  } else if (type === 'approval/asked') {
+    const record = state.approvalRecords?.get(data.id)
+    inner = record && window.DshApprovalRecords?.lineHtml(record, t)
+      || `<div class="approval-event">🔐 ${esc(data.toolName || t('tool.default'))}</div>`
   } else if (type === 'agent/status') {
     const running = !!data.running
     inner = `<div class="event" data-seq="${seq}">${running ? t('event.taskStart') : t('event.taskEnd')}</div>`
@@ -2813,13 +3144,22 @@ function eventHtml(entry, ctx = {}) {
   return inner
 }
 
-function blockHtml(b) {
+function blockHtml(b,index=0,context={}) {
   if (!b || typeof b !== 'object') return `<p>${esc(String(b))}</p>`
-  if ((b.type === 'tool-call' || b.type === 'tool-result') && LS.get('showTools', '1') === '0') return ''
+  if ((b.type === 'tool-call' || b.type === 'tool-result') && (context.suppressBlockTools || LS.get('showTools', '1') === '0')) return ''
+  if (typeof window !== 'undefined' && window.DshActivity) {
+    const key='block:'+context.seq+':'+index
+    if (b.type==='thinking'||b.type==='reasoning') return window.DshActivity.reasoning({text:b.text??b.content??'',key:window.DshActivity.reasoningKey(context,index,key)})
+    if (b.type==='tool-call'||b.type==='tool-result') return window.DshActivity.tool({key,name:b.name||b.toolName,...(b.type==='tool-call'?{args:b.arguments??b.args??b.input}:{result:b.result??b.output??b.content??b,error:!!(b.error||b.ok===false||b.isError)})})
+  }
   switch (b.type) {
-    case 'text': return `<div class="md">${window.mdToHtml ? window.mdToHtml(b.text ?? '', { fileLinks: true }) : esc(b.text ?? '')}</div>`
+    case 'text': return `<div class="md">${window.mdToHtml ? window.mdToHtml(b.text ?? '', { fileLinks: true, imageLabel: t('block.image') }) : esc(b.text ?? '')}</div>`
     case 'file': if (typeof window !== 'undefined' && window.DshChatFiles) return window.DshChatFiles.render(b); return `<div class="tool">📎 ${esc(b.attachment?.name || b.name || 'file')} <small>${esc(b.attachment?.bytes ?? b.bytes ?? '')} bytes</small></div>`
-    case 'image': return `<img alt="${t('block.image')}" src="data:${esc(b.mediaType || 'image/png')};base64,${esc(b.data || '')}">`
+    case 'image': {
+      if (b.attachment && window.DshImagePreview) return window.DshImagePreview.attachmentHtml(b.attachment, t('block.image'), state.current)
+    const alt = b.name || b.filename || t('block.image')
+      return `<button type="button" class="chat-image" data-chat-image aria-label="${esc(t('block.image'))}"><img alt="${esc(alt)}" src="data:${esc(b.mediaType || 'image/png')};base64,${esc(b.data || '')}" draggable="false"></button>`
+    }
     case 'thinking':
     case 'reasoning':
       return `<details class="tool"><summary>${t('block.thinking')}</summary><div class="tool-text">${esc(truncate(String(b.text ?? b.content ?? safeJson(b)), 6000))}</div></details>`
@@ -2859,11 +3199,29 @@ function statsHtml(s) {
 }
 
 let sessionSubagentsJob = null
+function rememberSubagent(entry, parentId) {
+  const childId = entry.id
+  const child = state.byId.get(childId) || { sessionId: childId, cwd: state.byId.get(parentId)?.cwd || '' }
+  Object.assign(child, { parentSessionId: parentId, origin: 'subagent', subagentMode: entry.mode || child.subagentMode || 'unknown' })
+  if (entry.label && !child.projections?.values?.title) {
+    child.projections ||= { values: {} }
+    child.projections.values ||= {}
+    child.projections.values.title = entry.label
+  }
+  state.byId.set(childId, child)
+  state.subagentSessions ||= {}
+  state.subagentSessions[childId] = child
+}
+async function openSubagentSession(childId, parentId, entry = {}, rootId = parentId) {
+  if (!childId || childId === parentId || state.current !== rootId) return
+  rememberSubagent({ ...entry, id: childId }, parentId)
+  await openSession(childId)
+}
 async function loadSessionSubagents(sessionId) {
   if (sessionSubagentsJob?.sessionId === sessionId && sessionSubagentsJob.connection.valid()) return sessionSubagentsJob.promise
   const connection = captureConnection(), job = { sessionId, connection }
   job.promise = (async () => {
-    const value = await safeRpc('subagent.list', { parentSessionId: sessionId }, '')
+    const value = await rpc('subagent.list', { parentSessionId: sessionId })
     return connection.valid() ? value : null
   })()
   sessionSubagentsJob = job
@@ -2924,30 +3282,15 @@ async function renderSessionCards() {
     }))
 
   // 子代理
-  const sub = await loadSessionSubagents(sessionId)
   if (!connection.valid() || renderGeneration !== sessionCardsRenderGeneration || state.current !== sessionId) return
-  if (sub?.entries?.length) {
-    const expanded = state.subagentExpandedSession === sessionId
-    const toggleLabel = expanded ? t('subagent.collapse') : t('subagent.expand')
-    const rows = sub.entries.map(e => {
-      if (e.kind === 'diagnostic') return `<div class="card-row"><span class="k">${t('subagent.diagnostic')}</span><span class="v">${esc(e.reason)}</span></div>`
-      const label = e.label || short(e.id)
-      const running = e.activity === 'running'
-      return `<div class="card-row"><span class="k">${running ? '▶ ' : ''}${esc(label)}</span><span class="v">${esc(e.mode)} ${running ? t('subagent.running') : ''}${e.mode === 'continuable' && running ? ` <button class="mini-btn" data-sub-interrupt="${esc(e.id)}">${t('subagent.interrupt')}</button>` : ''}</span></div>`
-    }).join('')
-    const subagentClosedIcon = 'M7 10l5 5 5-5'
-    const subagentOpenIcon = 'M7 14l5-5 5 5'
-    const subagentIcon = expanded ? subagentOpenIcon : subagentClosedIcon
-    box.insertAdjacentHTML('beforeend', `<div class="card subagent-card"><button type="button" class="subagent-toggle" data-subagent-toggle aria-expanded="${expanded}" aria-label="${esc(toggleLabel)}" title="${esc(toggleLabel)}"><span class="card-title">${esc(t('subagent.count', { n: sub.entries.length }))}</span><span class="subagent-toggle-icon" aria-hidden="true"><morph-icon data-morph-state="${expanded ? 'open' : 'closed'}" data-morph-closed="${subagentClosedIcon}" data-morph-open="${subagentOpenIcon}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${subagentIcon}"/></svg></morph-icon></span></button><div class="subagent-list${expanded ? '' : ' hidden'}">${rows}</div></div>`)
-    box.querySelector('[data-subagent-toggle]')?.addEventListener('click', () => {
-      const icon = box.querySelector('[data-subagent-toggle] morph-icon')
-      if (icon) icon.setAttribute('data-morph-state', expanded ? 'closed' : 'open')
-      state.subagentExpandedSession = expanded ? '' : sessionId
-      setTimeout(() => renderSessionCards(), 240)
-    })
-    box.querySelectorAll('[data-sub-interrupt]').forEach(btn =>
-      btn.addEventListener('click', () => interruptSubagent(btn.dataset.subInterrupt)))
-  }
+  window.DshSubagents?.configure($('btn-subagents'), {
+    sessionId, title: titleOf(s), activity: s.running === true ? 'running' : s.running === false ? 'inactive' : 'unknown', parentId: s.origin === 'subagent' ? s.parentSessionId : null,
+    valid: () => connection.valid() && state.current === sessionId,
+    read: loadSessionSubagents, remember: rememberSubagent,
+    onShow: () => conversationView?.pause(), onClose: () => conversationView?.resume(),
+    open: (entry, parentId) => openSubagentSession(entry.id, parentId, entry, sessionId),
+    interrupt: interruptSubagent,
+  })
 }
 
 function setGoalPhaseLocal(phase) {
@@ -2981,10 +3324,11 @@ async function goalAction(kind) {
   scheduleRefresh()
 }
 
-async function interruptSubagent(childId) {
+async function interruptSubagent(childId, parentId = state.current) {
+  const connection = captureConnection(), rootId = state.current
   if (!confirm(t('subagent.confirmInterrupt'))) return
-  const result = await safeRpc('subagent.interrupt', { parentSessionId: state.current, childSessionId: childId, mode: 'continuable' }, t('subagent.interruptFailed'))
-  if (result == null) return
+  const result = await safeRpc('subagent.interrupt', { parentSessionId: parentId, childSessionId: childId, mode: 'continuable' }, t('subagent.interruptFailed'))
+  if (result == null || !connection.valid() || state.current !== rootId) return
   toast(t('subagent.interruptSubmitted'), 'ok')
   setTimeout(renderSessionCards, 600)
 }
@@ -3053,53 +3397,74 @@ async function downloadSessionExport(sessionId) {
   }
 }
 
-async function runSlashCommand(text) {
+async function runSlashCommand(text, requireExecuted = false) {
   const clean = String(text || '').trim()
   if (!clean.startsWith('/') || !state.current) return false
   const sessionId = state.current, connection = captureConnection()
   const command = slashCommandName(clean)
-  const noFallback = NO_FALLBACK_SLASH_COMMANDS.has(command)
-  const longRunning = command === 'export'
+  const noFallback = command === 'permission' || NO_FALLBACK_SLASH_COMMANDS.has(command)
   try {
-    const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
-      ? AbortSignal.timeout(longRunning ? LONG_RUNNING_SLASH_COMMAND_TIMEOUT_MS : SLASH_COMMAND_TIMEOUT_MS)
-      : undefined
     const res = await fetch(apiUrl('/remote/api/command'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer ' + state.token, 'x-dsh-remote-client': CAP?.isNativePlatform?.() ? 'app' : 'web', ...clientIdHeaders() },
-      body: JSON.stringify({ sessionId, line: clean }),
-      ...(signal ? { signal } : {})
+      body: JSON.stringify({ sessionId, line: clean, async: true }),
+      signal: AbortSignal.timeout(command === 'export' ? LONG_RUNNING_SLASH_COMMAND_TIMEOUT_MS : SLASH_COMMAND_TIMEOUT_MS),
     })
-    if (!connection.valid()) return true
-    if (res.status === 401) { authFailure(); return true }
-    if (!res.ok) {
-      if (noFallback) toast(t('session.commandTimedOut'), 'err')
-      return noFallback
+    if (!connection.valid() || (state.current !== sessionId && command !== 'compact' && command !== 'export')) return !requireExecuted
+    if ([404, 405].includes(res.status) && !noFallback) return false
+    if (res.status === 401) { authFailure(); return !requireExecuted }
+    if (!res.ok) throw new Error('command response unavailable')
+    const data = await res.json()
+    if (!connection.valid() || (state.current !== sessionId && command !== 'compact' && command !== 'export')) return !requireExecuted
+    if (!data?.ok) throw new Error('command rejected')
+    if (data.executed === false) {
+      if (!noFallback) return false
+      throw new Error('control command not executed')
     }
-    const data = await res.json().catch(() => null)
-    if (!connection.valid()) return true
-    if (data?.ok === false) { toast(data.message || t('send.failed'), 'err'); return true }
-    if (data?.ok && data.executed === true) {
-      if (data.accepted) {
-        if (command === 'compact') {
-          setCompactionStatus(sessionId, { ...(data.operation || data.compact), active: true, command, source: 'command' })
-        } else {
-          state.pendingCommands[sessionId] = command
-          setTimeout(() => { if (connection.valid() && state.current === sessionId) void refreshCompactionStatus(sessionId) }, 600)
-        }
-      } else if (command === 'export') await downloadSessionExport(sessionId)
-      else toast(t('send.commandExecuted'), 'ok')
-      return true
-    }
-  } catch (e) {
-    if (!connection.valid() || state.current !== sessionId) return true
-    console.error('slash command bridge failed', e)
-    if (noFallback) {
-      toast(t('session.commandTimedOut'), 'err')
-      return true
-    }
+    if (data.executed !== true) throw new Error('unknown command result')
+    if (data.accepted) {
+      if (command === 'compact' || command === 'export') {
+        setCompactionStatus(sessionId, { ...(data.operation || data.compact), active: true, command, source: 'command' })
+      } else {
+        state.pendingCommands ||= {}
+        state.pendingCommands[sessionId] = command
+        const result = await waitCommandOperation(sessionId, data.operation, connection)
+        if (!connection.valid() || state.current !== sessionId) return !requireExecuted
+        delete state.pendingCommands[sessionId]
+        if (result.executed === false && !noFallback) return false
+        if (result.phase !== 'complete' || result.executed === false) throw new Error('command did not complete')
+      }
+    } else if (command === 'export') await downloadSessionExport(sessionId)
+    else if (!requireExecuted) toast(t('send.commandExecuted'), 'ok')
+    return true
+  } catch (error) {
+    if (!connection.valid() || state.current !== sessionId) return !requireExecuted
+    if (!requireExecuted) toast(t('session.commandTimedOut'), 'err')
+    // A lost response may follow execution. Only explicit not-executed responses can fall back.
+    return !requireExecuted
   }
-  return !connection.valid() || state.current !== sessionId
+}
+
+async function waitCommandOperation(sessionId, initial, connection) {
+  if (!initial || !initial.startedAt) throw new Error('missing operation identity')
+  const deadline = Date.now() + SLASH_COMMAND_TIMEOUT_MS
+  let operation = initial
+  while (Date.now() < deadline) {
+    if (!connection.valid() || state.current !== sessionId) throw new Error('stale command')
+    if (!operation.active) {
+      if (!['complete', 'failed'].includes(operation.phase)) throw new Error('unknown operation')
+      return operation
+    }
+    await new Promise(resolve => setTimeout(resolve, 100))
+    if (!connection.valid() || state.current !== sessionId) throw new Error('stale command')
+    const url = apiUrl('/remote/api/command-status') + '?sessionId=' + encodeURIComponent(sessionId)
+    const res = await fetch(url, { headers: { authorization: 'Bearer ' + state.token, ...clientIdHeaders() }, signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) })
+    if (!res.ok) throw new Error('command status unavailable')
+    const body = await res.json()
+    operation = body?.operation
+    if (body?.ok !== true || !operation || (initial.id ? operation.id !== initial.id : operation.startedAt !== initial.startedAt)) throw new Error('operation changed')
+  }
+  throw new Error('command result unconfirmed')
 }
 
 function bytesToBase64(bytes) {
@@ -3209,11 +3574,13 @@ function composerIsBusy() {
   return !!state.byId.get(state.current)?.running || (state.queues[state.current] || []).some(item => item.placement === 'queued')
 }
 function composerSendMode(alternate = false) {
+  if (window.DshWorkflow?.isMounted()) return alternate && composerIsBusy() ? 'steer' : 'queue'
   if (!steerSendingEnabled() || !composerIsBusy()) return 'queue'
   const preferred = LS.get('busySendMode', 'queue') === 'steer' ? 'steer' : 'queue'
   return alternate ? (preferred === 'queue' ? 'steer' : 'queue') : preferred
 }
 function renderComposerSend() {
+  window.DshWorkflow?.update()
   const enabled = steerSendingEnabled() && composerIsBusy()
   const mode = composerSendMode()
   for (const id of ['btn-send', 'btn-fs-send']) {
@@ -3232,6 +3599,7 @@ function renderComposerSend() {
     node.classList.toggle('hidden', !node.textContent)
     node.dataset.phase = feedback?.phase || 'hint'
   }
+  window.DshWorkflow?.update()
 }
 function setComposerSendFeedback(context, key, phase, message = '') {
   composerSendFeedback.set(context, { key, phase, message })
@@ -3304,11 +3672,13 @@ function bindComposerSend(button) {
 }
 
 async function sendSessionContent(text, images, requestedMode = 'queue') {
+  if (state.byId.get(state.current)?.origin === 'subagent') { toast('子代理记录为只读 / Subagent records are read only'); return false }
   const clean = String(text || '').trim()
   if ((!clean && !images.length) || !state.current || composerSending) return false
   const sessionId = state.current
   const context = composerContext()
-  const mode = requestedMode === 'steer' && steerSendingEnabled() && composerIsBusy() ? 'steer' : 'queue'
+  const onboardingContext = window.DshOnboarding ? { connection: connectionGeneration, session: sessionId } : null
+  const mode = requestedMode === 'steer' && (window.DshWorkflow?.isMounted() || steerSendingEnabled()) && composerIsBusy() ? 'steer' : 'queue'
   if (mode === 'steer' && clean.startsWith('/')) {
     setComposerSendFeedback(context, 'send.steerSlash', 'error')
     return false
@@ -3343,6 +3713,8 @@ async function sendSessionContent(text, images, requestedMode = 'queue') {
     if (composerContext() !== context) return !!v?.accepted
     if (v?.accepted) {
       state.sessionActivity.add(sessionId)
+      // Optional teaching UI must never turn a confirmed send into a failure.
+      if (!clean.startsWith('/')) { try { window.DshOnboarding?.record('message-accepted', onboardingContext) } catch {} }
       if (composerContext() === context) {
         setSessionRecovery('ready')
         noteSessionTurnTime(sessionId, Date.now())
@@ -3398,7 +3770,37 @@ async function sendMessage(requestedMode) {
 function hideComposerMenu() {
   $('composer-menu').classList.add('hidden')
   $('btn-plus').classList.remove('active')
-  $('permission-submenu')?.classList.add('hidden')
+}
+
+// 主机拥有权限模式（沙箱+审批捆绑）与可选目录；Remote 只按主机返回渲染，
+// 不为未安装或不存在的预设造选项。旧主机没有该目录时回退三种沙箱模式。
+// 目录直接作为“指令”列表中的权限模式行显示，Auto review 可用时同样出现在这里。
+function currentPermissionPreset() {
+  const perms = state.current ? proj(state.byId.get(state.current), 'permissions') : null
+  return typeof perms?.currentValue === 'string' ? perms.currentValue : ''
+}
+
+let permissionPresetRequest = 0
+function refreshPermissionPresets() {
+  const submenu = $('permission-submenu')
+  if (!submenu || !window.DshPermissionPresets) return
+  const request = ++permissionPresetRequest
+  const sessionId = state.current
+  const permissionConnection = captureConnection()
+  void window.DshPermissionPresets.open({
+    container: submenu,
+    current: currentPermissionPreset(),
+    connection: permissionConnection,
+    currentValid: () => permissionConnection.valid() && state.current === sessionId && request === permissionPresetRequest,
+    rpc,
+    t,
+    toast,
+    request: async (value) => {
+      if (!permissionConnection.valid() || !sessionId || state.current !== sessionId || request !== permissionPresetRequest) return false
+      return runSlashCommand('/permission ' + value, true)
+    },
+    close: hideComposerMenu,
+  })
 }
 
 function toggleComposerMenu() {
@@ -3406,6 +3808,7 @@ function toggleComposerMenu() {
   const show = menu.classList.contains('hidden')
   menu.classList.toggle('hidden', !show)
   $('btn-plus').classList.toggle('active', show)
+  if (show) refreshPermissionPresets()
   if (show && !state.models.loaded && !state.models.loading) loadSessionModels()
 }
 
@@ -3577,11 +3980,15 @@ async function confirmRenameSession() {
   }
 }
 
-async function newSession() {
+function loadSessionPresets(prefix) {
+  return window.DshSessionPresets.open({select:$(prefix+'-agent-preset'),hint:$(prefix+'-agent-preset-hint'),rpc,connection:captureConnection(),rendered:()=>syncCustomSelect($(prefix+'-agent-preset'))})
+}
+async function newSession(preferredWorkspace = '') {
   if (!state.token) { showView('view-settings'); return }
   if (!workspaceItems().length) await refreshWorkbench()
-  const preferred = workspaceById(state.workspaceFilter)?.workspaceId || LS.get('lastNewSessionWorkspaceV1', '')
+  const preferred = typeof preferredWorkspace === 'string' && preferredWorkspace || workspaceById(state.workspaceFilter)?.workspaceId || LS.get('lastNewSessionWorkspaceV1', '')
   renderNewSessionWorkspace(preferred)
+  void loadSessionPresets('new-session')
   $('modal-new-session').classList.remove('hidden')
 }
 function renderNewSessionWorkspace(preferredId = '') {
@@ -3606,11 +4013,13 @@ async function createSessionInWorkspace() {
   const connection = captureConnection()
   const workspaceId = $('new-session-workspace').value
   if (!workspaceById(workspaceId)) return toast(t('newSession.chooseWorkspace'), 'err')
+  const preset = window.DshSessionPresets.selection($('new-session-agent-preset'))
+  if (!preset.valid) return toast(window.DshSessionPresets.staleMessage(), 'err')
   const button = $('new-session-create')
   createSessionInWorkspace.busy = true
   button.disabled = true
   try {
-    const v = await safeRpc('session.create', { workspaceId: workspaceId }, t('home.createFailed'))
+    const v = await safeRpc('session.create', { workspaceId: workspaceId, ...preset.payload }, t('home.createFailed'))
     if (!connection.valid() || !v?.sessionId) return
     state.workspaceFilter = workspaceId
     state.fs.workspaceId = workspaceId
@@ -3619,9 +4028,12 @@ async function createSessionInWorkspace() {
     LS.set('lastNewSessionWorkspaceV1', workspaceId)
     closeNewSessionModal()
     toast(t('home.created'), 'ok')
-    await refreshSessions()
-    if (!connection.valid()) return
-    openSession(v.sessionId)
+    const workspace = workspaceById(workspaceId)
+    const session = { sessionId: v.sessionId, cwd: workspace?.path || '', running: false, projections: { values: {} } }
+    state.byId.set(session.sessionId, session)
+    state.sessions.unshift(session)
+    void openSession(session.sessionId)
+    void refreshSessions()
   } finally { createSessionInWorkspace.busy = false; button.disabled = false }
 }
 
@@ -3732,15 +4144,15 @@ async function probeOverviewLinks(signal) {
   let timer
   const controller=new AbortController(),cancel=()=>controller.abort()
   signal.addEventListener('abort',cancel,{once:true});if(signal.aborted)controller.abort()
-  timer=setTimeout(cancel,4000)
-  const healthRequest=fetch(base+'/health?probe=live&t='+Date.now(),{signal:controller.signal,cache:'no-store'}).then(async response=>{
+  timer=setTimeout(cancel,6500)
+  const healthRequest=fetch(base+'/health?probe=fresh&t='+Date.now(),{signal:controller.signal,cache:'no-store'}).then(async response=>{
     if(!response.ok)throw Error('health')
     const health=await response.json();if(health?.ok!==true)throw Error('health')
     return health
   }).catch(()=>null).finally(()=>{clearTimeout(timer);signal.removeEventListener('abort',cancel)})
   const [health,host]=await Promise.all([healthRequest,refreshHostDescription()])
   if(!connection.valid()||signal.aborted)throw Error('stale check')
-  if(health){if(host)health.upstreamReachable=true;state.gatewayHealth[base]=health}
+  if(health){state.gatewayHealth[base]=health}
   else delete state.gatewayHealth[base]
   return {gateway:!!health}
 }
@@ -3759,6 +4171,7 @@ window.addEventListener('offline',()=>startOverviewDetection(true))
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')startOverviewDetection(true);else {overviewDetector?.pause();overviewPulse?.pause()}})
 
 function renderOverview() {
+  window.DshWorkflow?.update()
   const ring = $('overview-pulse-ring')
   if (!ring) return
   const checks = overviewChecks()
@@ -3795,7 +4208,7 @@ function renderOverview() {
     ...state.questions.map(q => ({ kind: 'question', item: q }))
   ]
   $('overview-attention-count').textContent = pending.length ? t('overview.pendingCount', { n: pending.length }) : '—'
-  $('overview-attention-list').innerHTML = pending.length ? pending.slice(0, 3).map(({ kind, item }) => {
+  $('overview-attention-list').innerHTML = pending.length ? pending.map(({ kind, item }) => {
     const title = sessionLabelOf(state.byId.get(item.sessionId))
     if (kind === 'approval') return `<div class="overview-attention-item" data-overview-approval="${esc(item.approvalId)}">
       <span class="overview-item-mark">⌁</span><span class="overview-item-copy"><span class="overview-item-title">${esc(item.toolName || t('tool.default'))}</span><span class="overview-item-desc">${esc(approvalDetail(item))} · ${esc(title)}</span></span>
@@ -3811,6 +4224,7 @@ function renderOverview() {
   $('overview-attention-list').querySelectorAll('[data-overview-question]').forEach(btn => {
     btn.addEventListener('click', () => openQuestionModal(state.questions.find(q => q.rpcId === btn.dataset.overviewQuestion)))
   })
+  renderApprovalRecords()
 
   const topSessions = topLevelSessions()
   const running = topSessions.filter(s => s.running).length
@@ -3848,6 +4262,60 @@ function renderOverview() {
     <span class="overview-item-mark">${s.running ? '●' : '○'}</span><span class="overview-item-copy"><span class="overview-item-title">${esc(sessionLabelOf(s))}</span><span class="overview-item-desc">${s.running ? esc(t('sessions.running')) + ' · ' : ''}${esc(fmtTime(sessionSortTime(s)))}</span></span><span class="overview-item-arrow">›</span>
   </button>`).join('') : `<div class="overview-empty">${t('overview.noSession')}</div>`
   $('overview-session-list').querySelectorAll('[data-overview-session]').forEach(btn => btn.addEventListener('click', () => openSession(btn.dataset.overviewSession)))
+}
+
+/* ---------------- 审批记录 ---------------- */
+// 审批内容与结果来自会话审计事件（approval/asked + approval/decided）与实时审批帧；
+// 只记录主机已写日志的最小字段，不计模型 token，也不改写主机数据。
+const APPROVAL_RECORDS_KEY = 'dshApprovalRecordsV1:'
+function approvalRecordsKey() { return APPROVAL_RECORDS_KEY + encodeURIComponent(String(state.server || '')) }
+function ensureApprovalRecords() {
+  if (state.approvalRecordsServer === state.server) return
+  flushApprovalRecords()
+  state.approvalRecordsServer = state.server
+  state.approvalRecords = window.DshApprovalRecords ? window.DshApprovalRecords.restore(LS.get(approvalRecordsKey(), '[]')) : new Map()
+}
+let approvalRecordsSaveTimer = null
+let approvalRecordsPendingSave = null
+function flushApprovalRecords() {
+  clearTimeout(approvalRecordsSaveTimer); approvalRecordsSaveTimer = null
+  const pending = approvalRecordsPendingSave; approvalRecordsPendingSave = null
+  if (pending) { try { LS.set(pending.key, pending.value) } catch {} }
+}
+function resetApprovalRecords() {
+  clearTimeout(approvalRecordsSaveTimer); approvalRecordsSaveTimer = null; approvalRecordsPendingSave = null
+  state.approvalRecords = new Map(); state.approvalRecordsServer = state.server
+}
+function saveApprovalRecords() {
+  if (!window.DshApprovalRecords) return
+  clearTimeout(approvalRecordsSaveTimer)
+  approvalRecordsPendingSave = { key: approvalRecordsKey(), value: window.DshApprovalRecords.serialize(state.approvalRecords) }
+  approvalRecordsSaveTimer = setTimeout(flushApprovalRecords, 800)
+}
+function collectApprovalEvent(sessionId, event) {
+  ensureApprovalRecords()
+  if (!window.DshApprovalRecords?.fromEvent(state.approvalRecords, sessionId, event)) return false
+  saveApprovalRecords()
+  return true
+}
+function collectApprovalFrame(frame) {
+  ensureApprovalRecords()
+  if (!window.DshApprovalRecords?.fromFrame(state.approvalRecords, frame)) return false
+  saveApprovalRecords()
+  renderApprovalRecords()
+  return true
+}
+function renderApprovalRecords() {
+  const box = $('approval-records-list')
+  if (!box) return
+  ensureApprovalRecords()
+  const api = window.DshApprovalRecords
+  const rows = api ? api.list(state.approvalRecords, 8) : []
+  const count = $('approval-records-count')
+  if (count) count.textContent = rows.length ? t('pending.count', { n: rows.length }) : '—'
+  box.innerHTML = rows.length
+    ? rows.map(record => api.recordHtml(record, t, { session: titleOf(state.byId.get(record.sessionId)) })).join('')
+    : '<div class="empty">' + t('approval.recordsEmpty') + '</div>'
 }
 
 function renderPending() {
@@ -4054,7 +4522,7 @@ function renderQueue() {
   updateCancelBtn()
   updateSessionStatus()
   // 队列数量在会话列表已显示; 详情页不重复大 UI
-  $('history-hint').textContent = items.length ? t('history.queueAndCount', { q: items.length, n: state.history.visible.length }) : t('history.countOnly', { n: state.history.visible.length })
+  $('history-hint').textContent = items.length ? t('history.queueAndCount', { q: items.length, n: state.history.visible.filter(entry=>!['turn/start','turn/end'].includes(entry.event?.type)).length }) : t('history.countOnly', { n: state.history.visible.filter(entry=>!['turn/start','turn/end'].includes(entry.event?.type)).length })
   renderSessions()
 }
 
@@ -4146,6 +4614,12 @@ function fsPathInside(candidate, root) {
 }
 
 function resetFsForServer() {
+  const upload = state.fs.upload
+  if (upload) {
+    upload.cancelled = true
+    upload.controller?.abort()
+    try { upload.xhr?.abort() } catch {}
+  }
   state.fs.path = null
   state.fs.initial = null
   state.fs.loaded = false
@@ -4191,11 +4665,14 @@ async function openWorkspaceModal() {
   $('workspace-parent-path').textContent = state.fs.path || '~'
   $('workspace-name').value = ''
   $('modal-workspace').classList.remove('hidden')
+  void loadSessionPresets('workspace')
   setTimeout(() => $('workspace-name').focus(), 50)
 }
 function closeWorkspaceModal() { $('modal-workspace').classList.add('hidden') }
 async function createWorkspace() {
   if (createWorkspace.busy) return
+  const preset = window.DshSessionPresets.selection($('workspace-agent-preset'))
+  if (!preset.valid) return toast(window.DshSessionPresets.staleMessage(), 'err')
   const name = $('workspace-name').value.trim()
   if (!name) { toast(t('workspace.nameRequired'), 'err'); $('workspace-name').focus(); return }
   const connection = captureConnection()
@@ -4223,7 +4700,7 @@ async function createWorkspace() {
     } catch {}
     if (!connection.valid()) return
     const sessionPayload = workspace?.workspaceId ? { workspaceId: workspace.workspaceId } : { cwd: data.path }
-    const v = await safeRpc('session.create', sessionPayload, t('home.createFailed'))
+    const v = await safeRpc('session.create', { ...sessionPayload, ...preset.payload }, t('home.createFailed'))
     if (!connection.valid()) return
     if (workspace?.workspaceId) {
       state.workspaceFilter = workspace.workspaceId
@@ -4255,6 +4732,25 @@ function fsApiUrl(sub, params = {}) {
     if (v != null && v !== '') u.searchParams.set(k, v)
   }
   return u.href
+}
+
+/** 对话里 Markdown 图片的本地路径：相对路径按当前会话工作区解析，读取走 /fs/file。 */
+async function chatImageAttachment(attachmentId, sessionId) {
+  const connection = captureConnection()
+  if (!sessionId || sessionId !== state.current || !connection.valid()) throw new Error('stale image')
+  const result = await rpc('session.attachment', { sessionId, attachmentId })
+  if (!connection.valid() || state.current !== sessionId) throw new Error('stale image')
+  return result
+}
+function chatImageRequest(pathValue) {
+  const value = String(pathValue || '').trim()
+  if (!value) return null
+  let target = value
+  if (!/^(?:[A-Za-z]:[\\/]|\\\\|\/|~[\\/])/.test(value)) {
+    const root = state.byId.get(state.current)?.cwd || ''
+    if (root) target = root.replace(/[\\/]+$/, '') + (root.includes('\\') ? '\\' : '/') + value.replace(/^\.?[\\/]+/, '')
+  }
+  return { url: fsApiUrl('/file', { path: target }), headers: fsHeaders() }
 }
 
 function fsAuthError(status) {
@@ -4466,12 +4962,14 @@ async function cancelFsUpload() {
   const up = state.fs.upload
   if (!up) return
   up.cancelled = true
+  up.controller?.abort()
   try { up.xhr?.abort() } catch {}
   try {
     await fetch(fsApiUrl('/upload-control', { path: up.path, name: up.name, session: up.session, action: 'cancel' }), {
-      method: 'POST', headers: fsHeaders()
+      method: 'POST', headers: fsHeaders(), signal: AbortSignal.timeout(15000)
     })
   } catch {}
+  if (state.fs.upload !== up) return
   state.fs.upload = null
   hideFsProgress()
   setFsButtons(false)
@@ -4510,8 +5008,8 @@ function uploadFsFile(file) {
     try { prev.xhr?.abort() } catch {}
     try {
       fetch(fsApiUrl('/upload-control', { path: prev.path, name: prev.name, session: prev.session, action: 'cancel' }), {
-        method: 'POST', headers: fsHeaders()
-      })
+        method: 'POST', headers: fsHeaders(), signal: AbortSignal.timeout(15000)
+      }).catch(() => {})
     } catch {}
   }
   const up = {
@@ -4523,7 +5021,11 @@ function uploadFsFile(file) {
 }
 
 async function runFsUpload(up) {
-  if (!up || !up.file) return
+  if (!up || !up.file || up.active) return
+  const connection = up.connection ||= captureConnection()
+  const valid = () => connection.valid() && state.fs.upload === up && !up.cancelled
+  if (!valid()) return
+  up.controller = new AbortController()
   up.active = true
   up.cancelled = false
   up.paused = false
@@ -4534,6 +5036,8 @@ async function runFsUpload(up) {
     const xhr = new XMLHttpRequest()
     up.xhr = xhr
     xhr.open('POST', fsApiUrl('/upload', params))
+    xhr.timeout = window.DshNetwork?.profile().weak ? 180000 : 90000
+    xhr.ontimeout = () => { if (up.xhr === xhr) up.xhr = null; reject(new Error('上传等待超时，可查询进度后继续')) }
     xhr.setRequestHeader('authorization', 'Bearer ' + state.token)
     xhr.setRequestHeader('x-dsh-remote-client', CAP?.isNativePlatform?.() ? 'app' : 'web')
     if (CLIENT_ID) xhr.setRequestHeader('x-dsh-remote-client-id', CLIENT_ID)
@@ -4563,33 +5067,46 @@ async function runFsUpload(up) {
   })
 
   const probe = async () => {
-    const res = await fetch(fsApiUrl('/upload-probe', { path: up.path, name: up.name, session: up.session, size: String(up.size) }), { headers: fsHeaders() })
-    if (res.status === 401) { fsAuthError(401); return null }
-    const json = await res.json().catch(() => ({}))
-    if (json.ok) up.offset = json.partialSize || 0
+    const read = async signal => {
+      const res = await fetch(fsApiUrl('/upload-probe', { path: up.path, name: up.name, session: up.session, size: String(up.size) }), { headers: fsHeaders(), signal })
+      const json = await res.json()
+      return { status: res.status, json }
+    }
+    const { status, json } = window.DshNetwork?.readWithDeadline
+      ? await window.DshNetwork.readWithDeadline(read, window.DshNetwork.profile().readTimeout, up.controller.signal)
+      : await read(AbortSignal.timeout(45000))
+    if (!valid()) return null
+    if (status === 401) { fsAuthError(401); return null }
+    if (status !== 200 || !json.ok) throw new Error(json.error || ('HTTP ' + status))
+    if (!Number.isSafeInteger(json.partialSize) || json.partialSize < 0 || json.partialSize > up.size) throw new Error('Invalid upload offset')
+    up.offset = json.partialSize
     return json
   }
 
   let overwrite = false
   let wasResumed = false
+  let offsetCorrections = 0
   let hasher = new SHA256()
   try {
     const info = await probe()
-    if (info === null || up.cancelled) return
+    if (info === null || !valid()) return
     if (info.partialSize > 0) wasResumed = true
     if (info.targetExists && info.targetSize === up.size && !overwrite) {
       if (!confirm(t('fs.confirmOverwrite'))) { state.fs.upload = null; hideFsProgress(); setFsButtons(false); return }
       overwrite = true
     }
     if (up.offset > 0) await hashFsRange(up.file, hasher, 0, up.offset, up)
+    if (!valid()) return
     showFsProgress(Math.round(up.offset / Math.max(1, up.size) * 100), up.offset, up.size)
 
     while (up.offset < up.size) {
-      if (up.cancelled) return
-      const end = Math.min(up.offset + FS_CHUNK_SIZE, up.size)
+      if (!valid()) return
+      const chunkSize = up.chunkSize || (window.DshNetwork?.profile().weak ? 256 * 1024 : FS_CHUNK_SIZE)
+      const end = Math.min(up.offset + chunkSize, up.size)
       const blob = up.file.slice(up.offset, end)
       const before = hasher.clone()
       const chunkBytes = new Uint8Array(await blob.arrayBuffer())
+      if (!valid()) return
       if (up.pauseRequested) {
         const err = new Error(t('fs.pausedErr')); err.code = 'PAUSED'; throw err
       }
@@ -4598,7 +5115,11 @@ async function runFsUpload(up) {
       const params = { path: up.path, name: up.name, session: up.session, offset: String(up.offset), size: String(up.size) }
       if (isLast) { params.finish = '1'; params.sha256 = hasher.hex() }
       if (overwrite) params.overwrite = '1'
+      const startedAt = Date.now()
       const r = await uploadChunk(params, blob)
+      if (!valid()) return
+      const elapsed = Date.now() - startedAt
+      up.chunkSize = elapsed > 15000 ? Math.max(65536, Math.floor(chunkSize / 2)) : elapsed < 2000 ? Math.min(FS_CHUNK_SIZE, chunkSize * 2) : chunkSize
       if (r.status === 401) { fsAuthError(401); return }
       if (r.status === 200 && r.json.offset != null) { up.offset = r.json.offset; continue }
       if (r.status === 201) {
@@ -4621,8 +5142,10 @@ async function runFsUpload(up) {
         continue
       }
       if (r.status === 409 && r.json.error === 'offset-mismatch') {
-        hasher = before
-        await probe()
+        if (++offsetCorrections > 3) throw new Error('Upload offset keeps changing; query progress before retrying')
+        if (await probe() === null || !valid()) return
+        hasher = new SHA256()
+        if (up.offset > 0) await hashFsRange(up.file, hasher, 0, up.offset, up)
         continue
       }
       if (r.status === 422 && r.json.error === 'checksum-mismatch') {
@@ -4639,12 +5162,17 @@ async function runFsUpload(up) {
       const expected = hasher.hex()
       const params = { path: up.path, name: up.name, session: up.session, offset: String(up.offset), size: String(up.size), finish: '1', sha256: expected }
       if (overwrite) params.overwrite = '1'
-      const r = await uploadChunk(params, new Blob([]))
+      if (!valid()) return
+      if (up.pauseRequested) { const err = new Error(t('fs.pausedErr')); err.code = 'PAUSED'; throw err }
+      let r = await uploadChunk(params, new Blob([]))
+      if (!valid()) return
       if (r.status === 401) { fsAuthError(401); return }
       if (r.status === 409 && r.json.error === 'conflict') {
         if (!confirm(t('fs.confirmOverwrite2'))) { state.fs.upload = null; hideFsProgress(); setFsButtons(false); return }
         params.overwrite = '1'
-        return runFsUpload(up) // 目标冲突未写入, 重新走 probe + 空 finish
+        r = await uploadChunk(params, new Blob([]))
+        if (!valid()) return
+        if (r.status === 401) { fsAuthError(401); return }
       }
       if (r.status === 422 && r.json.error === 'checksum-mismatch') {
         const err = new Error(t('fs.checksumCleared'))
@@ -4668,7 +5196,7 @@ async function runFsUpload(up) {
     setFsButtons(false)
   } catch (e) {
     up.active = false
-    if (up.cancelled || e?.code === 'CANCELLED') return
+    if (!valid() || e?.code === 'CANCELLED') return
     if (e?.code === 'PAUSED') {
       up.paused = true
       setFsButtons(true, true)
@@ -4690,9 +5218,11 @@ async function runFsUpload(up) {
       toast(e.message, 'err')
       return
     }
-    hideFsProgress()
-    setFsButtons(false)
+    up.paused = true
+    setFsButtons(true, true)
     toast(t('fs.uploadInterrupted', { msg: e.message }), 'err')
+  } finally {
+    up.active = false
   }
 }
 
@@ -4906,7 +5436,7 @@ function announcementVoteKey(announcementId, pollId) {
 }
 function storeAnnouncementVote(announcementId, pollId, optionId) {
   const votes = readAnnouncementVotes()
-  votes[announcementVoteKey(announcementId, pollId)] = { optionId, votedAt: Date.now() }
+  votes[announcementVoteKey(announcementId, pollId)] = { ...(optionId ? { optionId } : { submitted: true }), votedAt: Date.now() }
   const keys = Object.keys(votes)
   if (keys.length > 100) {
     keys.sort((a, b) => Number(votes[a]?.votedAt || 0) - Number(votes[b]?.votedAt || 0))
@@ -4918,6 +5448,9 @@ function storeAnnouncementVote(announcementId, pollId, optionId) {
 function announcementVote(item) {
   if (!item?.poll?.id) return null
   const saved = readAnnouncementVotes()[announcementVoteKey(item.id, item.poll.id)]
+  // `submitted` is only ever written by the form path (storeAnnouncementVote with no
+  // optionId), so it already implies a non-legacy poll.
+  if (saved?.submitted) return { ...saved, option: { label: I18N.lang === 'en' ? 'Submitted' : '已提交' } }
   if (!saved?.optionId) return null
   const option = item.poll.options.find(entry => entry.id === saved.optionId)
   return option ? { ...saved, option } : null
@@ -4999,6 +5532,7 @@ function announcementVersionMatch(item) {
   return true
 }
 function normalizeAnnouncementPoll(value, announcementId) {
+  if (window.DshAnnouncementForms) return window.DshAnnouncementForms.normalize(value, announcementId)
   if (!value || typeof value !== 'object') return null
   const id = String(value.id || announcementId || '').trim().slice(0, 120)
   const question = String(value.question || '').trim().slice(0, 300)
@@ -5048,7 +5582,10 @@ function renderAnnouncementPoll(item) {
   if (!poll) return
   const vote = announcementVote(item)
   $('announcement-poll-question').textContent = poll.question
-  $('announcement-poll-options').innerHTML = poll.options.map(option => `
+  const forms = window.DshAnnouncementForms
+  $('announcement-poll-options').innerHTML = poll.legacy === false && forms
+    ? forms.render(poll, state.announcementDrafts?.[announcementVoteKey(item.id, poll.id)] || [], !!vote, I18N.lang === 'en')
+    : poll.options.map(option => `
     <label class="announcement-poll-option">
       <input type="radio" name="announcement-poll-option" value="${esc(option.id)}"${vote?.optionId === option.id ? ' checked' : ''}${vote ? ' disabled' : ''}>
       <span><strong>${esc(option.label)}</strong>${option.description ? `<small>${esc(option.description)}</small>` : ''}</span>
@@ -5058,7 +5595,8 @@ function renderAnnouncementPoll(item) {
   status.classList.toggle('hidden', !vote)
   const submit = $('announcement-poll-submit')
   submit.classList.toggle('hidden', !!vote)
-  submit.disabled = true
+  submit.disabled = !!vote || !!state.announcementSubmitting
+  if (poll.legacy !== false) submit.disabled = !document.querySelector('input[name="announcement-poll-option"]:checked') || !!state.announcementSubmitting
 }
 function renderAnnouncementPagination() {
   const total = state.announcementItems.length
@@ -5106,19 +5644,22 @@ function showAnnouncementAt(index) {
 async function submitAnnouncementVote() {
   const item = state.announcement
   const poll = item?.poll
+  if (!poll || state.announcementSubmitting) return
+  const forms = window.DshAnnouncementForms
   const optionId = document.querySelector('input[name="announcement-poll-option"]:checked')?.value || ''
-  const option = poll?.options.find(entry => entry.id === optionId)
-  if (!poll || !option) return toast(t('announcement.voteChoose'), 'err')
+  const option = poll.options.find(entry => entry.id === optionId)
+  const answer = poll.legacy === false && forms ? forms.validate(poll, { answers: forms.read($('announcement-poll-options'), poll) }) : option ? { optionId: option.id } : { error: 'answer required' }
+  if (answer.error) {
+    const q = poll.questions?.find(row => row.id === answer.questionId)
+    return toast((q ? q.question + '：' : '') + (I18N.lang === 'en' ? 'Check required answers and selection limits.' : '请检查必填内容、字数和选项数量。'), 'err')
+  }
+  const message = forms ? forms.encode(item.id, poll.id, answer) : `Poll ${poll.id}: ${option.id}`
+  if (!message) return toast(I18N.lang === 'en' ? 'Answers are too long. Please shorten them.' : '回答总长度过长，请适当精简。', 'err')
   const button = $('announcement-poll-submit')
   button.disabled = true
-  const payload = {
-    type: 'poll',
-    message: `Poll ${poll.id}: ${option.id}`,
-    announcementId: item.id,
-    pollId: poll.id,
-    optionId: option.id,
-    appVersion: state.localVersion
-  }
+  const connection = captureConnection(), valid = () => connection.valid() && state.announcement === item
+  state.announcementSubmitting = true
+  const payload = { type: 'poll', message, announcementId: item.id, pollId: poll.id, ...answer, appVersion: state.localVersion }
   try {
     const base = updateBase()
     let res = null
@@ -5135,8 +5676,8 @@ async function submitAnnouncementVote() {
         data = await res.json().catch(() => ({}))
       } catch {}
     }
-    // 没有网关地址、网关网络错误或令牌失效时，投票改走公网收集器。
-    if (!res || res.status === 401) {
+    // 仅旧单选投票保留公网兜底；含填写内容的表单只提交当前网关。
+    if ((!res || res.status === 401) && poll.legacy !== false && connection.valid()) {
       const directSignal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(8000) : undefined
       res = await fetch(DIRECT_POLL_FEEDBACK_URL, {
         method: 'POST',
@@ -5147,22 +5688,29 @@ async function submitAnnouncementVote() {
       })
       data = await res.json().catch(() => ({}))
     }
-    if (res.ok && data.ok) {
-      storeAnnouncementVote(item.id, poll.id, option.id)
+    if (!connection.valid()) return
+    if (res?.ok && data.ok) {
+      storeAnnouncementVote(item.id, poll.id, answer.optionId || '')
       markAnnouncementSeen(item.id)
-      renderAnnouncementPoll(item)
+      if (valid()) renderAnnouncementPoll(item)
       renderAnnouncementHistory()
-      toast(t('announcement.voteThanks', { option: option.label }), 'ok')
-    } else if (res.status === 429) {
+      toast(poll.legacy === false ? (I18N.lang === 'en' ? 'Submitted successfully' : '已成功提交') : t('announcement.voteThanks', { option: option.label }), 'ok')
+    } else if (res?.status === 429) {
       toast(t('announcement.voteAgainLater'), 'err')
       button.disabled = false
     } else {
-      toast(t('announcement.voteFailed', { msg: data.error || res.status }), 'err')
+      toast(t('announcement.voteFailed', { msg: data.error || res?.status || t('announcement.voteNetworkError') }), 'err')
       button.disabled = false
     }
   } catch (e) {
-    toast(t('announcement.voteFailed', { msg: e.message || t('announcement.voteNetworkError') }), 'err')
+    if (valid()) toast(t('announcement.voteFailed', { msg: e.message || t('announcement.voteNetworkError') }), 'err')
     button.disabled = false
+  } finally {
+    state.announcementSubmitting = false
+    if (connection.valid() && state.announcement?.poll) {
+      const active = state.announcement
+      button.disabled = !!announcementVote(active) || (active.poll.legacy !== false && !document.querySelector('input[name="announcement-poll-option"]:checked'))
+    }
   }
 }
 function closeAnnouncement(markSeen) {
@@ -5191,7 +5739,8 @@ async function fetchAnnouncements() {
     const seen = readSeenAnnouncements()
     const items = normalized.filter(item => !seen[item.id])
       .sort((a, b) => b.publishedAt - a.publishedAt)
-    if (!items.length || state.announcement) return false
+    // 新旧界面均提示未读公告；拉取期间新出现的版本提醒仍优先展示。
+    if (!items.length || state.announcement || isAppVersionWarningOpen()) return false
     openAnnouncementModal(items)
     return true
   } catch { return false }
@@ -5321,7 +5870,7 @@ async function checkUpdate(silent) {
     const res = await fetch(base + '/update.json?t=' + Date.now() + '&local=' + encodeURIComponent(state.localVersion))
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const info = await res.json()
-    openNotesModal(info)
+    if (!silent || !window.DshWorkflow?.isMounted()) openNotesModal(info)
     if (info.version && cmpVersion(info.version, state.localVersion) > 0) {
       state.updateInfo = info
       const hasNotes = !!(info.notes && String(info.notes).trim())
@@ -5379,6 +5928,7 @@ function finishUpdateDownload() {
   clearInterval(updateDownloadTimer)
   updateDownloadTimer = null
   $('btn-download-update').disabled = false
+  const forceButton=$('btn-force-download-update');if(forceButton)forceButton.disabled=false
 }
 
 async function verifyUpdateApk(info, url) {
@@ -5389,7 +5939,7 @@ async function verifyUpdateApk(info, url) {
   const resetTimeout = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort(), 60000) }
   try {
     resetTimeout()
-    const res = await fetch(url, { signal: controller.signal })
+    const res = await fetch(url, { signal: controller.signal, cache: 'no-store' })
     if (!res.ok) return { ok: false, status: res.status }
     total = Number(res.headers.get('content-length')) || 0
     const chunks = []
@@ -5420,23 +5970,36 @@ async function verifyUpdateApk(info, url) {
   finally { clearTimeout(timer); clearInterval(progressTimer) }
 }
 
-async function downloadUpdate() {
-  const info = state.updateInfo
-  if (!info || updateDownloadBusy) return
-  const url = new URL(info.apkUrl || 'dsh-remote.apk', updateBase() + '/').href
-  const sha256 = String(info.sha256 || '').trim().toLowerCase()
-  if (!/^[0-9a-f]{64}$/.test(sha256)) {
-    // 无 SHA-256 的更新包一律不下载、不安装
-    updateDownloadProgress({ phase: 'error', error: t('update.hashMissing') })
-    return
-  }
+async function downloadUpdate(force = false) {
+  if (updateDownloadBusy || (force !== true && !state.updateInfo)) return
+  const base=updateBase()
+  if(!base){toast(t('update.needServer'),'err');return}
+  const connection=captureConnection()
   updateDownloadBusy = true
   updateDownloadSample = null
   $('btn-download-update').disabled = true
-  updateDownloadProgress({ phase: 'downloading', received: 0, total: 0 })
-  if (CAP?.isNativePlatform?.() && window.NativeUpdate?.downloadVerifiedAndInstall && window.NativeUpdate?.getDownloadStatus) {
-    try {
+  const forceButton=$('btn-force-download-update');if(forceButton)forceButton.disabled=true
+  let nativePending=false
+  try {
+    let info=state.updateInfo
+    if(force===true){
+      updateDownloadProgress({phase:'checking',received:0,total:0})
+      // Same-version patches deliberately bypass only version comparison. Both
+      // metadata and APK bytes are fetched afresh; hash verification still applies.
+      const response=await fetch(base+'/update.json?t='+Date.now()+'&local='+encodeURIComponent(state.localVersion||''),{cache:'no-store',signal:AbortSignal.timeout(15000)})
+      if(!response.ok)throw new Error('HTTP '+response.status)
+      info=await response.json()
+    }
+    if(!connection.valid())return
+    const sha256=String(info?.sha256||'').trim().toLowerCase()
+    if(!/^[0-9a-f]{64}$/.test(sha256))throw new Error(t('update.hashMissing'))
+    const target=new URL(info.apkUrl||'dsh-remote.apk',base+'/')
+    if(force===true)target.searchParams.set('dshPatch',Date.now().toString(36)+'-'+sha256.slice(0,16))
+    const url=target.href
+    updateDownloadProgress({ phase: 'downloading', received: 0, total: 0 })
+    if (CAP?.isNativePlatform?.() && window.NativeUpdate?.downloadVerifiedAndInstall && window.NativeUpdate?.getDownloadStatus) {
       if (!window.NativeUpdate.downloadVerifiedAndInstall(url, sha256)) throw new Error(t('update.busy'))
+      nativePending=true
       const poll = () => {
         try {
           const value = JSON.parse(window.NativeUpdate.getDownloadStatus())
@@ -5446,12 +6009,11 @@ async function downloadUpdate() {
       }
       updateDownloadTimer = setInterval(poll, 500)
       poll()
-    } catch (error) { updateDownloadProgress({ phase: 'error', error: error.message }); finishUpdateDownload() }
-    return
-  }
-  try {
+      return
+    }
     const result = await verifyUpdateApk(info, url)
-    if (!result.ok) throw new Error(result.corrupted ? t('update.corrupted') : result.status ? t('update.serverFileMissing') : result.msg || t('fs.networkError'))
+    if(!connection.valid())return
+    if (!result.ok) throw new Error(result.corrupted ? t(force===true?'update.patchMismatch':'update.corrupted') : result.status ? t('update.serverFileMissing') : result.msg || t('fs.networkError'))
     {
       // 无校验的原生安装入口已移除: 新旧壳统一走下方"下载并本地校验"路径。
       const objectUrl = URL.createObjectURL(result.blob)
@@ -5464,8 +6026,8 @@ async function downloadUpdate() {
       setTimeout(() => URL.revokeObjectURL(objectUrl), 60000)
       updateDownloadProgress({ phase: 'complete', received: result.blob.size, total: result.blob.size })
     }
-  } catch (error) { updateDownloadProgress({ phase: 'error', error: error.message }) }
-  finally { finishUpdateDownload() }
+  } catch (error) { if(connection.valid())updateDownloadProgress({ phase: 'error', error: error.message }) }
+  finally { if(!nativePending)finishUpdateDownload() }
 }
 
 
@@ -5602,7 +6164,14 @@ function applyBgConfigFromNative() {
     if (opts.some(o => o.value === v)) $('bg-interval').value = v
     syncCustomSelect($('bg-interval'))
     if ($('opt-task-done')) $('opt-task-done').checked = cfg.notifyTaskDone !== false
-    $('bg-auth-status')?.classList.toggle('hidden', !cfg.loginExpired)
+    const status = $('bg-auth-status')
+    if (status) {
+      status.removeAttribute('data-i18n')
+      status.textContent = cfg.loginExpired ? t('settings.bgAuthFailed') : cfg.enabled && cfg.serviceRunning === false
+        ? (I18N.lang === 'en' ? 'Background receiver is not running. Reopen the app or toggle to retry. ' : '后台接收未运行，返回应用或重新开关后重试。') + (cfg.serviceState || '')
+        : cfg.enabled && cfg.serviceRunning === true ? (I18N.lang === 'en' ? 'Background receiver is running.' : '后台接收运行中。') + (cfg.lastSuccessAt ? ' ' + new Date(cfg.lastSuccessAt).toLocaleTimeString() : '') : ''
+      status.classList.toggle('hidden', !status.textContent)
+    }
   } catch {}
 }
 function saveBgConfig(enabled) {
@@ -5611,12 +6180,13 @@ function saveBgConfig(enabled) {
   const base = bgBase()
   const intervalMin = parseFloat($('bg-interval')?.value || '0.5') || 0.5
   const notifyTaskDone = $('opt-task-done')?.checked !== false
-  b.saveBackgroundConfig(JSON.stringify({ enabled, intervalMin, base, token: state.token || '', clientId: CLIENT_ID || '', notifyTaskDone }))
+  const saved = b.saveBackgroundConfig(JSON.stringify({ enabled, intervalMin, base, token: state.token || '', clientId: CLIENT_ID || '', notifyTaskDone })) !== false
   if (enabled) $('bg-auth-status')?.classList.add('hidden')
-  return true
+  return saved
 }
 function syncBgConfig() {
   if ($('opt-bg-poll')?.checked && state.token) saveBgConfig(true)
+  void syncPeakReminders()
 }
 
 /* ---------------- 预设提示词 ---------------- */
@@ -5691,8 +6261,7 @@ function deletePreset(id) {
   toast(t('presets.deleted'), 'ok')
 }
 
-/* ---------------- 峰谷计费提醒(前台服务进程内定时, 绕开 MIUI 后台限制) ---------------- */
-function peakRemindOn() { return LS.get('peakRemind', '0') === '1' }
+/* ---------------- 插件规则驱动的 Android 峰谷通知 ---------------- */
 const LEGACY_PEAK_NOTIFICATION_IDS = [8801, 8802, 8803, 8804]
 
 async function cancelLegacyPeakNotifications() {
@@ -5708,32 +6277,55 @@ async function cancelLegacyPeakNotifications() {
   }
 }
 
-async function schedulePeakReminders({ legacyCleaned = false } = {}) {
-  if (!CAP?.isNativePlatform?.()) return false
-  if (!legacyCleaned && !await cancelLegacyPeakNotifications()) return false
-  const b = bgBridge()
-  if (!b?.startPeakReminder) return false
-  try {
-    return b.startPeakReminder() !== false
-  } catch { return false }
-}
-
 async function cancelPeakReminders() {
   if (!CAP?.isNativePlatform?.()) return false
+  const legacyCleaned = await cancelLegacyPeakNotifications()
   const b = bgBridge()
+  if (b?.savePeakReminderConfig) return b.savePeakReminderConfig(JSON.stringify({ enabled: false })) !== false && legacyCleaned
   if (!b?.stopPeakReminder) return false
   try {
     const stopped = b.stopPeakReminder() !== false
-    const legacyCleaned = await cancelLegacyPeakNotifications()
     return stopped && legacyCleaned
   } catch { return false }
 }
 
 async function restorePeakReminders() {
-  if (!CAP?.isNativePlatform?.()) return
-  // 旧版使用 LocalNotifications 每日调度；无论当前开关状态都先清理，防止与前台服务重复提醒。
-  const legacyCleaned = await cancelLegacyPeakNotifications()
-  if (peakRemindOn() && legacyCleaned) await schedulePeakReminders({ legacyCleaned: true })
+  await cancelLegacyPeakNotifications()
+  let enabled = LS.get('peakRemind', '')
+  if (!enabled) {
+    try { enabled = JSON.parse(bgBridge()?.getPeakReminderConfig?.() || '{}').enabled ? '1' : '0' } catch { enabled = '0' }
+  }
+  $('opt-peak-remind').checked = enabled === '1'
+  LS.set('peakRemind', enabled)
+  if (enabled === '1') await syncPeakReminders()
+}
+let peakReminderRead = 0
+async function syncPeakReminders() {
+  const b = bgBridge()
+  if (!CAP?.isNativePlatform?.() || !b?.savePeakReminderConfig) return false
+  const enabled = LS.get('peakRemind', '0') === '1', serial = ++peakReminderRead
+  const config = { enabled, base: bgBase(), token: state.token || '', clientId: CLIENT_ID || '' }
+  const status = $('peak-remind-status'), say = value => { if (status) status.textContent = value }
+  const started = b.savePeakReminderConfig(JSON.stringify(config)) !== false
+  if (!enabled) { say(''); return started }
+  if (!started) { say(I18N.lang === 'en' ? 'Background receiver failed to start. Check system restrictions.' : '后台提醒未启动，请检查系统限制后重试。'); return false }
+  if (!state.token) { say(t('settings.bgNeedToken')); return false }
+  say(I18N.lang === 'en' ? 'Reading dsh-cost-meter rules…' : '正在读取 dsh-cost-meter 规则…')
+  const connection = captureConnection()
+  try {
+    const response = await fetch(connection.server + '/remote/api/insights/peak-reminders', { headers: { authorization: 'Bearer ' + connection.token, 'x-dsh-remote-client': 'app', ...clientIdHeaders() }, signal: AbortSignal.timeout(20000) })
+    const data = await response.json()
+    if (!connection.valid() || serial !== peakReminderRead) return false
+    if (!response.ok || data.ok !== true) throw Error('unavailable')
+    b.savePeakReminderConfig(JSON.stringify({ ...config, policy: data }))
+    say(data.available !== true ? (I18N.lang === 'en' ? 'No compatible cost-meter rules on this host.' : '主机未提供兼容的费用插件规则，请检查插件和网关版本。')
+      : data.enabled === false ? (I18N.lang === 'en' ? 'Reminders are disabled in dsh-cost-meter.' : '费用插件已关闭峰谷提醒，请在 DSH 峰谷计价设置中开启。')
+      : (I18N.lang === 'en' ? 'Rules synced. Android will deliver reminders in the background.' : '规则已同步，由 Android 在后台发送通知。'))
+    return data.available === true
+  } catch {
+    if (connection.valid() && serial === peakReminderRead) say(I18N.lang === 'en' ? 'Rules could not refresh. The receiver will retry; only unexpired cached rules apply.' : '规则暂未刷新，后台会重试；仅使用未过期的已缓存规则。')
+    return false
+  }
 }
 
 /* ---------------- 模型设置 ---------------- */
@@ -6289,6 +6881,10 @@ async function openModelConfigDocument() {
 }
 /* ---------------- 视图切换 ---------------- */
 function showView(id) {
+  if (id !== 'view-session') window.DshSubagents?.close()
+  document.body?.classList.toggle('viewing-subagent', id === 'view-session' && state.byId.get(state.current)?.origin === 'subagent')
+  window.DshWorkflow?.close()
+  if (window.DshWorkflow?.isMounted() && id === 'view-activity') id = 'view-home'
   if (id !== 'view-session') conversationView?.pause()
   if (id !== 'view-session' && document.body.classList.contains('in-session') && state.current) void archiveEmptySessionOnLeave(state.current)
   for (const v of ['view-home', 'view-files', 'view-session', 'view-activity', 'view-plugins', 'view-settings']) $(v).classList.toggle('hidden', v !== id)
@@ -6779,6 +7375,7 @@ function initToken() {
     state.token = LS.get('token', '')
   }
   loadServers()
+  doctorSessionHandoff = window.DshDoctorEntry?.restoreSessionConnection?.({state,newId:newServerId,persist:()=>{LS.set('token',state.token);saveServers()}}) === true
   if (urlToken) {
     state.token = normalizedServerToken(urlToken)
     LS.set('token', state.token)
@@ -6853,7 +7450,7 @@ function renderDshControlOperation(operation) {
   const desc = $('dsh-control-desc')
   const box = $('dsh-control-steps')
   if (!desc || !box || !operation) return
-  const failed = operation.stage === 'failed' || operation.done && operation.ok === false
+  const failed = operation.stage !== 'unknown' && (operation.stage === 'failed' || operation.done && operation.ok === false)
   desc.textContent = failed ? t('settings.dshFailed', { msg: dshControlFailureText(operation) }) : dshControlStageText(operation)
   const steps = Array.isArray(operation.steps) && operation.steps.length
     ? operation.steps
@@ -6879,20 +7476,45 @@ async function readDshControlResponse(res) {
   try { return JSON.parse(text) } catch { return { error: `HTTP ${res.status}`, detail: text.slice(0, 500) } }
 }
 
-async function pollDshControlOperation(operationId, initial) {
+let dshControlPollContext = null
+function dshControlContext() {
+  const connection = captureConnection(), url = adminApiUrl('/admin/api/dsh')
+  return { ...connection, url }
+}
+
+async function pollDshControlOperation(operationId, initial, context = dshControlContext()) {
   let value = initial
-  while (true) {
+  if (context.valid() && value?.done) { renderDshControlOperation(value); return value }
+  const deadline = Math.min(Number(initial?.deadlineAt) || Date.now() + 60000, Date.now() + 320000)
+  let failures = 0
+  while (context.valid() && Date.now() < deadline) {
     renderDshControlOperation(value)
     if (value.done) return value
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 700))
-    const res = await fetch(adminApiUrl(`/admin/api/dsh?operation=${encodeURIComponent(operationId)}`), {
-      headers: { authorization: 'Bearer ' + state.token }, cache: 'no-store'
-    })
-    if (res.status === 401) { authFailure(); throw Object.assign(new Error('unauthorized'), { auth: true }) }
-    const next = await readDshControlResponse(res)
-    if (!res.ok) throw Object.assign(new Error(next.error || next.message || `HTTP ${res.status}`), { dshPayload: { ...next, httpStatus: res.status } })
-    value = next
+    await new Promise(resolvePromise => setTimeout(resolvePromise, Math.min(700 * (failures + 1), 3000)))
+    if (!context.valid()) return null
+    try {
+      const res = await fetch(context.url + '?operation=' + encodeURIComponent(operationId), {
+        headers: { authorization: 'Bearer ' + context.token }, cache: 'no-store', signal: AbortSignal.timeout(8000)
+      })
+      if (!context.valid()) return null
+      if (res.status === 401) { authFailure(); throw Object.assign(new Error('unauthorized'), { auth: true }) }
+      const next = await readDshControlResponse(res)
+      if (!context.valid()) return null
+      if (!res.ok) {
+        if (res.status === 404 || res.status === 429 || res.status >= 500) throw new Error('gateway recovering')
+        throw Object.assign(new Error(next.error || next.message || `HTTP ${res.status}`), { dshPayload: { ...next, httpStatus: res.status } })
+      }
+      if (next.operationId !== operationId) throw new Error('invalid operation response')
+      value = next; failures = 0
+      if (value.done) { renderDshControlOperation(value); return value }
+    } catch (error) {
+      if (!context.valid()) return null
+      if (error.auth || error.dshPayload) throw error
+      failures++
+      value = { ...value, done: false, stage: 'recovering', message: t('settings.dshRecovering') }
+    }
   }
+  return context.valid() ? { ...value, done: true, ok: false, stage: 'unknown', code: 'RESULT_UNKNOWN', message: t('settings.dshResultUnknown') } : null
 }
 
 function renderDshControlStatus(value) {
@@ -6923,6 +7545,7 @@ function renderDshControlStatus(value) {
 
 async function loadDshControl() {
   if (!state.token || !$('dsh-control-desc')) return
+  const context = dshControlContext()
   if (activeGatewayCapability('dshLifecycle') === false) {
     renderDshControlStatus({
       supported: false,
@@ -6931,43 +7554,62 @@ async function loadDshControl() {
     return
   }
   try {
-    const res = await fetch(adminApiUrl('/admin/api/dsh'), { headers: { authorization: 'Bearer ' + state.token }, cache: 'no-store' })
+    const res = await fetch(context.url, { headers: { authorization: 'Bearer ' + context.token }, cache: 'no-store', signal: AbortSignal.timeout(8000) })
+    if (!context.valid()) return
     if (res.status === 401) return authFailure()
     const value = await readDshControlResponse(res)
+    if (!context.valid()) return
     if (!res.ok) throw Object.assign(new Error(value.error || value.message || `HTTP ${res.status}`), { dshPayload: value })
+    if (dshControlPollPromise && dshControlPollContext?.valid()) return
     renderDshControlStatus(value)
-    if (value.operation?.operationId && !value.operation.done && !dshControlPollPromise) {
-      dshControlPollPromise = pollDshControlOperation(value.operation.operationId, value.operation)
-        .then(renderDshControlOperation)
+    if (value.operation?.operationId && !value.operation.done) {
+      dshControlPollContext = context
+      const job = pollDshControlOperation(value.operation.operationId, value.operation, context)
+        .then(result => { if (context.valid() && result) renderDshControlOperation(result) })
         .catch(error => {
-          if (!error?.auth) $('dsh-control-desc').textContent = t('settings.dshFailed', { msg: error?.dshPayload ? dshControlFailureText(error.dshPayload) : t('settings.dshResultUnknown') })
+          if (context.valid() && !error?.auth) $('dsh-control-desc').textContent = t('settings.dshFailed', { msg: error?.dshPayload ? dshControlFailureText(error.dshPayload) : t('settings.dshResultUnknown') })
         })
-        .finally(() => { dshControlPollPromise = null; dshControlButtonsBusy(false, true) })
+        .finally(() => { if (dshControlPollPromise === job) { dshControlPollPromise = null; if (context.valid()) void loadDshControl() } })
+      dshControlPollPromise = job
     }
   } catch (error) {
+    if (!context.valid()) return
     $('dsh-control-desc').textContent = t('settings.dshStatusFailed', { msg: error?.dshPayload ? dshControlFailureText(error.dshPayload) : t('conn.off') })
   }
 }
 
 async function controlDsh(action) {
-  if (dshControlPollPromise) return
+  if (dshControlPollPromise && dshControlPollContext?.valid()) return
+  const context = dshControlContext(), requestId = uuid()
+  let release
+  const busy = new Promise(resolve => { release = resolve })
+  dshControlPollPromise = busy; dshControlPollContext = context
   const label = action === 'start' ? t('settings.dshStart') : t('settings.dshRestart')
   dshControlButtonsBusy(true, true)
   renderDshControlOperation({ action, service: 'dsh-web', accepted: true, done: false, stage: 'queued', elapsedMs: 0, steps: [] })
   try {
-    const res = await fetch(adminApiUrl('/admin/api/dsh'), {
+    let res
+    try { res = await fetch(context.url, {
       method: 'POST',
-      headers: { authorization: 'Bearer ' + state.token, 'content-type': 'application/json' },
-      body: JSON.stringify({ action }),
-    })
+      headers: { authorization: 'Bearer ' + context.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ action, requestId }), signal: AbortSignal.timeout(8000),
+    }) } catch {
+      if (!context.valid()) return
+      const recovered = await pollDshControlOperation(requestId, { action, done: false, deadlineAt: Date.now() + 60000 }, context)
+      if (context.valid() && recovered) renderDshControlOperation(recovered)
+      return
+    }
+    if (!context.valid()) return
     if (res.status === 401) return authFailure()
     let v = await readDshControlResponse(res)
+    if (!context.valid()) return
     if (res.status === 409 && v.operation?.operationId) v = v.operation
     else if (!res.ok) throw Object.assign(new Error(v.error || v.message || `HTTP ${res.status}`), { dshPayload: { ...v, httpStatus: res.status } })
 
     if (v.accepted && v.operationId) {
-      dshControlPollPromise = pollDshControlOperation(v.operationId, v)
-      v = await dshControlPollPromise
+      v = await pollDshControlOperation(v.operationId, v, context)
+      if (!context.valid() || !v) return
+      if (v.stage === 'unknown') { renderDshControlOperation(v); return }
       if (!v.ok) throw Object.assign(new Error(dshControlFailureText(v)), { dshPayload: v })
       renderDshControlOperation(v)
       toast(dshControlStageText(v), 'ok')
@@ -6979,6 +7621,7 @@ async function controlDsh(action) {
     renderDshControlStatus(v)
     toast(t('settings.dshStarted', { action: label }), 'ok')
   } catch (error) {
+    if (!context.valid()) return
     if (error?.auth) return
     const payload = error?.dshPayload
     const message = payload ? dshControlFailureText(payload) : t('settings.dshResultUnknown')
@@ -6986,8 +7629,8 @@ async function controlDsh(action) {
     else $('dsh-control-desc').textContent = t('settings.dshFailed', { msg: message })
     toast(t('settings.dshFailed', { msg: message }), 'err')
   } finally {
-    dshControlPollPromise = null
-    dshControlButtonsBusy(false, true)
+    release()
+    if (dshControlPollPromise === busy) { dshControlPollPromise = null; if (context.valid()) void loadDshControl() }
   }
 }
 
@@ -7001,7 +7644,8 @@ const THEME_META = [
   { id: 'dark', sw: ['#161316', '#302323', '#FFB86B'] },
   { id: 'light', sw: ['#F5F7F8', '#FFFFFF', '#176B87'] },
   { id: 'neutral', sw: ['#EEF1E8', '#FAFBF6', '#47643C'] },
-  { id: 'mono', sw: ['#050505', '#333333', '#F5F5F5'] }
+  { id: 'mono', sw: ['#050505', '#333333', '#F5F5F5'] },
+  { id: 'fish', sw: ['#EAF6FF', '#FFFFFF', '#2F52D0'] }
 ]
 
 function renderThemeBtn() {
@@ -7080,7 +7724,7 @@ function bindUi() {
     if (state.current) { renderSessionTitle(); renderSessionSub(); renderSessionCards(); renderHistory(true) }
     else renderModelMenu()
     loadLocalVersion()
-    if (state.hostInfo) $('host-desc').textContent = t('settings.hostDesc', { version: state.hostInfo.version, cwd: state.hostInfo.cwd, n: state.hostInfo.attachedSessions })
+    if (state.hostInfo) $('host-desc').textContent = hostDescriptionText(state.hostInfo)
     $('token-desc').textContent = state.token ? t('token.savedLocal') : t('token.notSet')
   })
   $('btn-theme').addEventListener('click', openThemePanel)
@@ -7113,7 +7757,11 @@ function bindUi() {
       if (first.matches('button')) first.focus({ preventScroll: true })
     }
   })
-  // 会话列表点击
+  // 会话列表点击与键盘激活共享目标。
+  $('session-list').addEventListener('keydown', event => {
+    const card = event.target.closest('[data-session-swipe]')
+    if (card && event.target === card && ['Enter', ' '].includes(event.key)) { event.preventDefault(); void openSession(card.dataset.id) }
+  })
   $('session-list').addEventListener('click', (e) => {
     if (swipeSuppressClickUntil > Date.now()) { swipeSuppressClickUntil = 0; return }
     if (e.target.closest('[data-archived-toggle]')) {
@@ -7150,14 +7798,7 @@ function bindUi() {
     }
     const newButton = e.target.closest('[data-wb-new]')
     if (newButton) {
-      safeRpc('session.create', { workspaceId: newButton.dataset.wbNew }, t('home.createFailed')).then(async v => {
-        if (!v?.sessionId) return
-        state.workspaceFilter = newButton.dataset.wbNew
-        LS.set('workspaceFilterV1', state.workspaceFilter)
-        toast(t('home.created'), 'ok')
-        await refreshSessions()
-        openSession(v.sessionId)
-      })
+      void newSession(newButton.dataset.wbNew)
       return
     }
     const head = e.target.closest('.wb-project-head')
@@ -7192,6 +7833,8 @@ function bindUi() {
     closeFeedbackSheet()
   })
   $('btn-write-feedback').addEventListener('click', () => { closeFeedbackSheet(); openFeedbackModal() })
+  $('btn-doctor').addEventListener('click', openDoctor)
+  $('home-doctor').addEventListener('click', openDoctor)
   $('fb-cancel').addEventListener('click', closeFeedbackModal)
   $('fb-submit').addEventListener('click', submitFeedback)
   $('feedback-success-confirm').addEventListener('click', closeFeedbackSuccess)
@@ -7288,23 +7931,8 @@ function bindUi() {
   $('composer-menu').addEventListener('click', async (e) => {
     const chip = e.target.closest('[data-cmd]')
     if (chip) {
-      if (chip.dataset.cmd === '/permission') {
-        const submenu = $('permission-submenu')
-        submenu?.classList.toggle('hidden')
-        return
-      }
-      $('permission-submenu')?.classList.add('hidden')
       const input = $('composer-input')
       input.value = chip.dataset.cmd + ' '
-      input.focus()
-      autosize(input)
-      hideComposerMenu()
-      return
-    }
-    const perm = e.target.closest('[data-perm]')
-    if (perm) {
-      const input = $('composer-input')
-      input.value = '/permission ' + perm.dataset.perm + ' '
       input.focus()
       autosize(input)
       hideComposerMenu()
@@ -7362,7 +7990,16 @@ function bindUi() {
   $('announcement-next').addEventListener('click', () => showAnnouncementAt(state.announcementIndex + 1))
   $('announcement-later').addEventListener('click', () => closeAnnouncement(false))
   $('announcement-confirm').addEventListener('click', () => closeAnnouncement(true))
-  $('announcement-poll-options').addEventListener('change', () => { $('announcement-poll-submit').disabled = false })
+  const saveAnnouncementDraft = () => {
+    const item = state.announcement
+    if (item?.poll?.legacy === false && window.DshAnnouncementForms) {
+      state.announcementDrafts ||= Object.create(null)
+      state.announcementDrafts[announcementVoteKey(item.id, item.poll.id)] = window.DshAnnouncementForms.read($('announcement-poll-options'), item.poll)
+    }
+    $('announcement-poll-submit').disabled = !!state.announcementSubmitting
+  }
+  $('announcement-poll-options').addEventListener('change', saveAnnouncementDraft)
+  $('announcement-poll-options').addEventListener('input', saveAnnouncementDraft)
   $('announcement-poll-submit').addEventListener('click', submitAnnouncementVote)
   $('modal-announcement').addEventListener('click', (e) => {
     if (e.target === $('modal-announcement') && !state.announcementItems.some(item => item.force)) closeAnnouncement(false)
@@ -7434,7 +8071,8 @@ function bindUi() {
   $('btn-dsh-start')?.addEventListener('click', () => controlDsh('start'))
   $('btn-dsh-restart')?.addEventListener('click', () => controlDsh('restart'))
   $('btn-check-update').addEventListener('click', () => checkUpdate(false))
-  $('btn-download-update').addEventListener('click', downloadUpdate)
+  $('btn-download-update').addEventListener('click', () => void downloadUpdate())
+  $('btn-force-download-update').addEventListener('click', () => void downloadUpdate(true))
   $('btn-update-expand').addEventListener('click', toggleUpdateExpand)
   $('app-version-later').addEventListener('click', () => closeAppVersionWarning(false))
   $('app-version-update').addEventListener('click', () => closeAppVersionWarning(true))
@@ -7477,35 +8115,20 @@ function bindUi() {
     LS.set('notify', e.target.checked ? '1' : '0')
     window.NativeBackground?.setPendingNotificationsEnabled?.(e.target.checked)
   })
-  $('opt-peak-remind').checked = peakRemindOn()
-  $('opt-peak-remind').addEventListener('change', async (e) => {
-    if (e.target.checked) {
-      if (!CAP?.isNativePlatform?.()) {
-        e.target.checked = false
-        return toast(t('peakRemind.browserOnly'), 'err')
-      }
-      const ok = await ensureNotify()
-      if (!ok) { e.target.checked = false; return toast(t('settings.notifyDenied')) }
-      const started = await schedulePeakReminders()
-      if (!started) {
-        e.target.checked = false
-        return toast(t('peakRemind.failed'), 'err')
-      }
-      toast(t('peakRemind.on'), 'ok')
-    } else {
-      const stopped = await cancelPeakReminders()
-      if (!stopped) {
-        e.target.checked = true
-        return toast(t('peakRemind.failed'), 'err')
-      }
-      toast(t('peakRemind.off'), 'ok')
-    }
-    LS.set('peakRemind', e.target.checked ? '1' : '0')
-  })
   $('btn-test-notify').addEventListener('click', sendTestNotification)
   $('btn-announcement-history').addEventListener('click', openAnnouncementHistory)
-  // 启动时先清理旧版 LocalNotifications，再按当前开关恢复前台提醒服务。
+  // 启动时清理旧版 LocalNotifications 和前台提醒服务，提醒交给 dsh-cost-meter。
   restorePeakReminders()
+  $('opt-peak-remind').addEventListener('change', async event => {
+    const input = event.target
+    if (input.checked) {
+      if (!CAP?.isNativePlatform?.() || !bgBridge()?.savePeakReminderConfig) { input.checked = false; return toast(t('peakRemind.browserOnly'), 'err') }
+      if (!state.token) { input.checked = false; return toast(t('settings.bgNeedToken'), 'err') }
+      if (!await ensureNotify()) { input.checked = false; return toast(t('settings.notifyDenied'), 'err') }
+    }
+    LS.set('peakRemind', input.checked ? '1' : '0')
+    await syncPeakReminders()
+  })
   applyBgConfigFromNative()
   $('opt-bg-poll').addEventListener('change', async (e) => {
     if (e.target.checked) {
@@ -7519,8 +8142,9 @@ function bindUi() {
       }
       const ok = await ensureNotify()
       if (!ok) { e.target.checked = false; return toast(t('settings.notifyDenied')) }
-      saveBgConfig(true)
-      toast(t('settings.bgOn'), 'ok')
+      const saved = saveBgConfig(true)
+      applyBgConfigFromNative()
+      toast(saved ? t('settings.bgOn') : (I18N.lang === 'en' ? 'Could not start background receiver. Check system restrictions.' : '后台接收启动失败，请检查系统限制后重试。'), saved ? 'ok' : 'err')
     } else {
       saveBgConfig(false)
       toast(t('settings.bgOff'), 'ok')
@@ -7557,10 +8181,11 @@ function bindUi() {
   bindFsPullRefresh()
 
   bindRail()
+  window.DshImagePreview?.configure?.({ resolvePath: chatImageRequest, resolveAttachment: chatImageAttachment })
 
   for (const id of ['history', 'question-body']) window.DshChatFiles?.bind($(id), () => {
     const c=captureConnection(),sessionId=id==='history'?state.current:state.questionModal?.sessionId
-    return { ...c,sessionId,cwd:sessionCwd(state.byId.get(sessionId)),native:!!CAP?.isNativePlatform?.(),headers:{authorization:'Bearer '+c.token,...clientIdHeaders()},notice:toast,
+    return { ...c,sessionId,cwd:sessionCwd(state.byId.get(sessionId)),native:!!CAP?.isNativePlatform?.(),headers:{authorization:'Bearer '+c.token,...clientIdHeaders()},notice:toast,preview:(path,name)=>window.DshWorkflow?.preview({...c,headers:{authorization:'Bearer '+c.token}},path,name),
       valid:()=>c.valid()&&sessionId===(id==='history'?state.current:state.questionModal?.sessionId) }
   })
   initCustomSelects()
@@ -7600,7 +8225,7 @@ async function boot() {
     $('token-desc').textContent = t('token.notSetHint')
   } else {
     // 多服务器: 启动时静默测速一次, 选最快的连接(同源页面也参与比较)
-    await selectFastestServer({ silent: true, reconnect: false })
+    if (!doctorSessionHandoff) await selectFastestServer({ silent: true, reconnect: false })
     await maybeWarnAppBehindGateway({ probe: true })
     overviewStarting=false
     openStreams()
@@ -7617,6 +8242,118 @@ async function boot() {
 }
 
 document.addEventListener('DOMContentLoaded', boot)
+document.addEventListener('DOMContentLoaded', mountWorkflow)
+
+function mountWorkflow() {
+  window.DshWorkflow?.mount({
+    desktop: false,
+    start: () => { if (!$('view-activity').classList.contains('hidden')) showView('view-home') },
+    snapshot: () => ({ token: !!state.token, host: currentServerEntry()?.note || state.server || location.host,
+      gateway: activeGatewayHealth()?.ok || !!state.streamsOk?.mux, dsh: dshReachable(),
+      mux: !!state.streamsOk?.mux, hostEvents: !!state.streamsOk?.host,
+      pending: state.approvals.length + state.questions.length, busy: composerIsBusy(), sending: composerSending }),
+    settings: name => { showView('view-settings'); showSettingsPage(name) },
+    plugins: () => showView('view-plugins'), models: loadSessionModels, send: sendMessage,
+    feedback: openFeedbackModal,
+    browse: () => { closeNewSessionModal(); showView('view-files') },
+    register: async () => {
+      const connection=captureConnection(), path=state.fs.path
+      if(!path)return toast('请先选择主机目录','err')
+      try {
+        const value=await rpc('workspace.create',{path})
+        if(!connection.valid()||!value?.workspace)return
+        state.wbProjects=[...state.wbProjects.filter(w=>w.workspaceId!==value.workspace.workspaceId),value.workspace]
+        state.workspaceFilter=value.workspace.workspaceId;closeWorkspaceModal();await newSession()
+      }catch(error){if(connection.valid())toast(error.message,'err')}
+    },
+    command: runSlashCommand, refresh: refreshAll, retry: () => { startOverviewDetection(true); void refreshAll() },
+    operations: () => { const connection=captureConnection(); return { url:apiUrl,headers:{authorization:'Bearer '+connection.token},valid:connection.valid } },
+    relay: () => { const connection=captureConnection(); return { url:()=>adminApiUrl('/admin/api/relay'),headers:{authorization:'Bearer '+connection.token},valid:connection.valid,connected:!!connection.token } },
+    discover: () => { if (confirm('登记当前绑定目录下的子目录为工作区？')) void refreshWorkbench({ discover: true }) },
+    files: () => {
+      const workspace = workspaceForSession(state.byId.get(state.current))
+      if (workspace) return openWorkspaceFiles(workspace.workspaceId)
+      const cwd = sessionCwd(state.byId.get(state.current))
+      if (!cwd) return toast('当前会话没有工作目录', 'err')
+      state.fs.loaded = true; showView('view-files'); void loadFs(cwd, { resetRoot: true })
+    },
+    approvalRecords: renderApprovalRecords,
+    clearApprovalRecords: resetApprovalRecords,
+    clear: clearWorkflowData,
+    admin: () => {
+      const url = new URL(adminApiUrl('/admin/'), location.href)
+      // Open authenticated management through its own login flow. No credential
+      // in a newly created URL, browser history, or referrer.
+      window.open(url.href, '_blank', 'noopener,noreferrer')
+    },
+    recover: (row, receipt) => {
+      const value = receipt.result?.result?.value
+      if (row.method === 'session.create' && value?.sessionId) void openSession(value.sessionId)
+      if (row.sessionId === state.current) void resyncCurrentSession()
+    },
+  })
+  mountOnboarding()
+}
+
+function mountOnboarding() {
+  window.DshOnboarding?.mount({
+    snapshot: () => ({ connection: connectionGeneration, session: state.current,
+      connected: navigator.onLine !== false && !!state.token && dshReachable()
+        && (!!state.streamsOk?.mux || (state.streamMode === 'poll' && !!state.hostInfo)),
+      sessionReady: state.sessionRecovery.status === 'ready' && !state.history.loading }),
+    actions: {
+      connect: () => { showView('view-settings'); showSettingsPage('servers') },
+      session: () => { showView('view-home'); return newSession() },
+      message: () => { if (state.current) showView('view-session'); else { showView('view-home'); return newSession() } },
+      results: () => window.DshWorkflow?.showOperations(),
+      files: () => showView('view-files'),
+      branch: () => { if (state.current) showView('view-session'); else showView('view-home') },
+      doctor: openDoctor,
+      feedback: () => openFeedbackModal({ preserveDraft: true }),
+    },
+    example: value => {
+      const input = $('composer-input')
+      if (!state.current || input.value.trim()) return false
+      input.value = value
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      showView('view-session'); input.focus()
+      return true
+    },
+    closePractice: () => {
+      closeNewSessionModal(); closeFeedbackModal(); window.DshWorkflow?.close()
+    },
+  })
+}
+
+async function clearWorkflowData(kind) {
+  const english = window.I18N?.lang === 'en'
+  const messages = { history: english ? 'Clear cached conversation history on this device?' : '清除这台设备的会话历史缓存？主机记录保留。',
+    connection: english ? 'Remove the current address and its saved credential? Other addresses remain.' : '移除当前地址和保存的凭证？其他连接条目保留。',
+    all: english ? 'Clear all Remote settings and credentials on this device and stop background reminders?' : '清除本机全部 Remote 配置与凭证，并停止后台轮询和提醒？主机数据保留。' }
+  if (!confirm(messages[kind])) return
+  if (kind === 'history') {
+    clearTimeout(scheduleHistoryCacheSave._t)
+    await window.DshHistory.cacheClear()
+    for (let i=localStorage.length-1;i>=0;i--) { const key=localStorage.key(i); if (/^dsh-remote-(?:sessions|history)/.test(key)) localStorage.removeItem(key) }
+    return toast(english ? 'History cache cleared' : '历史缓存已清除', 'ok')
+  }
+  window.NativeBackground?.saveBackgroundConfig?.(JSON.stringify({ enabled:false, base:'', token:'', clientId:'', intervalMin:1, notifyTaskDone:false }))
+  window.NativeBackground?.savePeakReminderConfig?.(JSON.stringify({ enabled:false }))
+  window.NativeBackground?.setPendingNotificationsEnabled?.(false)
+  if (kind === 'connection') {
+    const current = currentServerEntry()
+    if (current) state.servers = state.servers.filter(server => server.id !== current.id)
+    state.groupActive[state.activeGroup] = ''
+    state.token = ''; state.server = ''; LS.del('token'); LS.del('server'); saveServers()
+    closeStream('mux'); closeStream('host'); stopPolling(); renderServers(); showView('view-settings'); showSettingsPage('servers')
+    return
+  }
+  await cancelPeakReminders()
+  clearTimeout(scheduleHistoryCacheSave._t)
+  await window.DshHistory.cacheClear()
+  window.DshWorkflow.clearStorage()
+  location.reload()
+}
 
 function openPluginPage(route = 'manage') {
   const connection = captureConnection()
@@ -7625,7 +8362,25 @@ function openPluginPage(route = 'manage') {
     return
   }
   window.DshExtensions.mount({
-    connection, getSession: () => state.byId.get(state.current), getTitle: () => sessionTitleValue(state.byId.get(state.current)),
+    connection,getWorkspaces: () => workspaceItems(),
+    getWorkspaceId: () => workspaceById(state.workspaceFilter)?.workspaceId || workspaceForSession(state.byId.get(state.current))?.workspaceId || '',
+    openTeamCaptain: async id => { if (!connection.valid()) return; await openSession(id) },
+    openTaskSession: async (id, workspaceId) => {
+      if (!connection.valid() || $('view-plugins').classList.contains('hidden')) return
+      if (!workspaceItems().some(row => row.workspaceId === workspaceId)) throw Error('unavailable')
+      await openSession(id)
+    },
+    openTeamMember: async (id, parentId) => {
+      const selected = state.current
+      const catalog = await loadSessionSubagents(parentId)
+      if (!connection.valid() || $('view-plugins').classList.contains('hidden') || state.current !== selected) return
+      const entry = catalog?.entries?.find(row => row.id === id)
+      if (!entry || entry.kind === 'diagnostic') throw Error('unavailable')
+      rememberSubagent(entry, parentId)
+      await openSession(id)
+    },
+     getSession: () => state.byId.get(state.current), getTitle: () => sessionTitleValue(state.byId.get(state.current)),
+    back: () => showView('view-settings'),
     openContext: () => void openInsights('context', true),
     returnToSession: () => showView('view-session'), scrollTop: () => window.scrollTo(0,0),
     url: path => connection.server + path,
@@ -7633,3 +8388,6 @@ function openPluginPage(route = 'manage') {
     valid: connection.valid,
   }, $('plugin-page'), route)
 }
+
+// Operation logs stay on this device; users can copy or export them.
+globalThis.DshDiagnostics?.configure({surface:"mobile",copy:copyText,snapshot:()=>({sessionId:state.current,server:state.server,loading:!!state.history.loading,loaded:!!state.history.loaded,count:state.history.visible.length,...globalThis.DshDiagnostics.nativeSnapshot()})})

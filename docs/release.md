@@ -31,7 +31,9 @@
 
 APK 常用路径：`android/app/build/outputs/apk/debug/app-debug.apk`、`apk/dsh-remote.apk`、`packages/plugin/apk/dsh-remote.apk`。三者内容哈希应一致。APK 不放进 `public/`，避免被再次打入 App assets。
 
-Android versionName 将 RC 连字符转换为点。当前 versionCode 公式为 `major*100000 + minor*1000 + patch*10 + (rc或9)`：它只保证 rc.1–rc.8 低于同版正式版，rc.9 与正式版相等、更大 RC 会跨槽。发布脚本允许任意正整数 RC，因此多轮 RC 必须额外核对升级顺序，不能宣称该公式对所有 RC 单调。文档核对没有修改这个实现。
+Android versionName 将 RC 连字符转换为点；versionCode 独立保存在根 `package.json` 的 `androidVersionCode` 中，不按语义版本分槽。基线与已公开 `0.8.0-rc.9` 一致，为 `8009`。`release.mjs` 在目标版本变化时将计数加一，同版本重试/重建保持原值；构建、CI 和插件同步不额外消耗计数。Gradle 调用 `scripts/android-version.mjs` 校验版本与计数，缺失、非整数、非正数或超过 2100000000 均失败。禁止通过手动降低计数发布旧包。
+
+例如连续发布 rc.9 → rc.10 → 0.8.0 → 0.10.0 → 1.0.0，版本码依次为 8009、8010、8011、8012、8013；若 rc.9 直接进入正式 0.8.0，则为 8010。不存在次版本两位数、补丁或 RC 次数跨槽的问题。已公开附件不重写；applicationId、侧载签名和存储键保持原样。仍须在设备上验证从公开 rc.9 覆盖安装后连接配置、缓存及后台开关保留。版本码和签名核验不能代替系统安装器实测。规则依据 [Android 版本管理说明](https://developer.android.com/studio/publish/versioning)，回归为 `tests/android-version.test.js` 与 `tests/release.test.js`。
 
 ## 正式发布与 CI
 
@@ -43,11 +45,17 @@ npm run release <version>
 
 脚本提交当前工作区的全部非忽略变更，推送 `origin main`，使用 `tag -f` 与强制推送 tag；没有自动替用户选择分支或判断全部改动是否应发布。已有 tag 的替换也需要符合用户接受的发布范围。
 
-CI 先等待 Windows 文件专项门禁；随后 Node 22/JDK 21 环境执行安装、插件同步一致性、Android 构建、本地 publish、双平台二进制、独立插件仓库同步、SHA256SUMS、GitHub Release 和 npm 发布。当前 release workflow **没有执行全量 `npm run check`**，所以本地全量门禁不能省略。独立仓库同步位于 Release 上传之前，失败可能阻塞后续步骤；npm 在资产上传后执行，npm 失败不撤销已上传资产。
+CI 先等待 Windows 文件专项门禁；随后 Node 22/JDK 21 环境执行安装、插件同步一致性、Android 构建、本地 publish 和 Windows/Linux 二进制构建，并上传本次构建的公共资产。macOS 任务复用 `macos-build.yml`：在 Apple Silicon runner 上先执行全量 `npm run check`，再下载相同 APK 与版本元数据、构建 arm64 网关，完成 ad-hoc 签名、验签和隔离启动/静态资源/关闭冒烟。所有平台成功后，发布任务汇总资产、同步插件，再执行独立插件仓库同步、SHA256SUMS、GitHub Release 和 npm 发布；macOS 失败会阻止发布。本地全量门禁仍不能省略，CI 不替代用户真机与完整 DSH 集成验收。独立仓库同步位于 Release 上传之前，失败可能阻塞后续步骤；npm 在资产上传后执行，npm 失败不撤销已上传资产。
 
-当前主要资产为 `dsh-remote.apk`、`dsh-remote-linux-x64`、`dsh-remote-win-x64.exe` 和 `SHA256SUMS.txt`。macOS 不在该工作流的构建目标内；已有预览资产不代表每版同步。HAP 同样不在流程内。
+主发布工作流资产为 `dsh-remote.apk`、`dsh-remote-linux-x64`、`dsh-remote-win-x64.exe`、`dsh-remote-macos-arm64` 和 `SHA256SUMS.txt`。macOS 目前仅 Apple Silicon，产物未做 Apple 公证；首次运行见[安装指南](getting-started.md#独立网关)。`macos-preview.yml` 保留手动预览入口，复用相同的 macOS 构建与验证步骤，发布到独立预览 tag。Intel Mac 可使用 npm 插件或 Node.js 源码方式；HAP 不在此流程内。工作流修改需要提交、推送后才在线生效。
 
 RC 标记为 prerelease，npm 用 `next`；稳定版用 `latest`。若精确 npm 版本已存在，CI 跳过发布，这不自动证明 dist-tag 正确。
+
+用户明确要求 RC 发布到 latest 时，可在该次发布期间将仓库变量 `RELEASE_CHANNEL` 设为 `latest`；现有工作流会将 GitHub prerelease 设为 false，并使用 npm latest。完成后恢复原变量状态，避免影响后续普通 RC。另需读回 GitHub `/releases/latest` 和 npm dist-tag，不能只看 CI 成功。
+
+用户指定移除过时的 npm `next` 时，将 `RETIRED_NEXT_VERSION` 设为待移除的精确版本。CI 发布成功后再次确保目标版本绑定到所选通道，仅在 `latest` 发布且当前 `next` 仍指向该精确版本时移除 `next`；若已指向其他版本则保留。完成后清除这次临时退休版本变量，保留用户明确要求的 `RELEASE_CHANNEL` 状态。此操作不撤销历史 npm 包版本。
+
+`public/build.json` 的构建标识以源码内容计算，文本统一为 LF、路径统一为 `/` 后排序，保证 Windows 本机构建与 Linux CI 的插件同步检查一致。
 
 ## 发布后独立核验
 

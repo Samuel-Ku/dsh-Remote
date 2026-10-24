@@ -81,6 +81,9 @@ test('插件面板显示运行中认证异常，并报告 HTTP 200 中的操作�
   const api = vm.runInNewContext('let latest; ' + renderCode + toggleCode + '; ({render, toggleGateway})', {
     $, t: panelT, text: (id, value) => { $(id).textContent = value }, Date,
     usageLoadedAt: Date.now(), renderUsage() {}, loadUsage() {}, busy: false, setBusy() {}, API: '/remote/admin/api',
+    // v0.8.0's render() hands state to the shared setup module; the panel slice
+    // alone no longer carries that binding, so the sandbox provides a stub.
+    setup: { update() {}, show() {} },
     fetch: async (_url, options) => {
       assert.equal(JSON.parse(options.body).action, 'stop')
       return { ok: true, json: async () => ({ ok: false, error: '请手动重启网关' }) }
@@ -101,5 +104,12 @@ test('侧边栏面板中英文字典键一致且英文可展示', () => {
     assert.ok(value && !/[一-鿿]/.test(value), key)
   }
   assert.equal(PLUGIN_STR.en.statusOk, 'All systems normal')
-  assert.equal(panelT('descOk', { devices: 2, reqs: 7 }), '2 台设备在线 · 最近请求 7 次')
+  // v0.8.0's panel replaced the old device/request summary with a plain online
+  // count, and moved most content into the shared UI modules; the dictionary now
+  // belongs to the panel's own strings.
+  assert.equal(panelT('onlineConnections', { count: 2 }), '2 个在线连接')
+  for (const key of ['statusConnecting', 'doctorAction', 'quotaTitle', 'onlineConnections', 'pairAction', 'about']) {
+    assert.ok(PLUGIN_STR.zh[key], `zh.${key}`)
+    assert.ok(PLUGIN_STR.en[key], `en.${key}`)
+  }
 })

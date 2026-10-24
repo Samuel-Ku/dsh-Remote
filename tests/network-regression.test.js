@@ -98,16 +98,15 @@ test('并发会话卡片请求不会重复追加子代理', () => {
   }
 })
 
-test('子代理卡片默认折叠并支持展开收起', () => {
+test('手机与桌面使用共享子代理树组件', () => {
   for (const relative of ['public/app.js', 'public/desktop/desktop.js']) {
     const source = fs.readFileSync(path.join(ROOT, relative), 'utf8')
-    assert.match(source, /subagentExpandedSession/, relative)
-    assert.match(source, /data-subagent-toggle/, relative)
-    assert.match(source, /aria-expanded=\"\$\{expanded\}\"/, relative)
-    assert.match(source, /subagent-list\$\{expanded \? '' : ' hidden'\}/, relative)
-    assert.match(source, /state\.subagentExpandedSession = expanded \? '' : sessionId/, relative)
-    assert.match(source, /data-morph-state="\$\{expanded \? 'open' : 'closed'\}"/, relative)
-    assert.match(source, /setTimeout\(\(\) => renderSessionCards\(\), 240\)/, relative)
+    assert.ok(source.includes('DshSubagents?.configure'), relative)
+    assert.ok(source.includes('read: loadSessionSubagents'), relative)
+  }
+  for (const relative of ['public/index.html', 'public/desktop/desktop.html']) {
+    const html = fs.readFileSync(path.join(ROOT, relative), 'utf8')
+    assert.ok(html.includes('subagents.js') && html.includes('subagents.css'), relative)
   }
 })
 
@@ -515,7 +514,7 @@ test('投票支持网关不可达时直连公网收集器托底，普通反馈�
   const source = fs.readFileSync(path.join(ROOT, 'public/app.js'), 'utf8')
   assert.match(source, /DIRECT_POLL_FEEDBACK_URL\s*=\s*'https:\/\/vm-0-2-ubuntu\.tail1f6fc4\.ts\.net\/submit'/)
   const vote = source.slice(source.indexOf('async function submitAnnouncementVote'), source.indexOf('function closeAnnouncement', source.indexOf('async function submitAnnouncementVote')))
-  assert.match(vote, /if \(!res \|\| res\.status === 401\)/)
+  assert.match(vote, /if \(\(!res \|\| res\.status === 401\) && poll\.legacy !== false/)
   assert.match(vote, /fetch\(DIRECT_POLL_FEEDBACK_URL[\s\S]{0,260}mode: 'cors'/)
   const feedback = source.slice(source.indexOf('async function submitFeedback'), source.indexOf('function fmtTime', source.indexOf('async function submitFeedback')))
   assert.doesNotMatch(feedback, /DIRECT_POLL_FEEDBACK_URL/)

@@ -18,8 +18,8 @@ function fixture(file) {
     return elements.get(id)
   }
   const store = new Map()
-  const context = vm.createContext({ $, TextEncoder, Uint8Array, Uint32Array, Map, Set, clearTimeout, setTimeout,
-    location: { origin: 'http://origin' }, window: {},
+  const context = vm.createContext({ $, AbortSignal, TextEncoder, Uint8Array, Uint32Array, Map, Set, clearTimeout, setTimeout,
+    location: { origin: 'http://origin' }, window: {DshSessionPresets:{selection:()=>({valid:true,payload:{}})}},
     LS: { get: (key, fallback) => store.get(key) ?? fallback, set: (key, value) => store.set(key, value), del: key => store.delete(key) },
     emptyHistory: () => ({ visible: [] }), emptyDesktopHistory: () => ({ visible: [] }), scheduleHistoryCacheSave() {},
     t: key => key, toast() {}, renderSessions() {}, renderOverviewDesktop() {}, applyPendingProjections() {}, refreshWorkbench() {}, scheduleWorkbenchRefresh() {},
@@ -27,12 +27,27 @@ function fixture(file) {
     fsApiUrl: () => 'http://A/fs', fsHeaders: () => ({}), fsAuthError() {}, esc: value => value,
     closeWorkspaceModal() {}, loadFs: async () => {}, refreshSessions: async () => {}, openSession() {},
   })
-  vm.runInContext(section(source, 'const state = {') + '\n' + section(source, '// Increment on every identity transition', file.includes('desktop') ? '\nconst streams' : '\nconst $') + '\nthis.state = state; this.captureConnection = captureConnection', context)
+  vm.runInContext(section(source, 'const state = {') + '\n' + section(source, 'function cancelHistoryLoad(') + '\n' + section(source, '// Increment on every identity transition', file.includes('desktop') ? '\nconst streams' : '\nconst $') + '\nthis.state = state; this.captureConnection = captureConnection', context)
   context.state.server = 'http://A'; context.state.token = 'token-a'
   if (!file.includes('desktop')) vm.runInContext(fs.readFileSync(path.join(__dirname, '../public/sha256.js'), 'utf8') + '\n' + section(source, 'const CACHE = {', '\nconst state'), context)
   return { context, source, store, $ }
 }
 for (const file of sources) {
+  test(file + ': automatic handoff cancels the old read and exits the invalidated chat', () => {
+    const { context: c } = fixture(file), tasks=[],views=[]
+    let aborted=false,inSession=true
+    c.queueMicrotask=fn=>tasks.push(fn)
+    c.document={getElementById:()=>null,body:{classList:{contains:()=>inSession,remove:()=>{inSession=false}}}}
+    c.restoreCachedSessionList=()=>{}
+    c.renderPending=c.renderNotifStack=c.renderModelSettings=()=>{}
+    c.showView=id=>{views.push(id);c.state.view=id}
+    c.state.current='old';c.state.view='view-chat'
+    c.state.history={loading:true,loadController:{abort:()=>{aborted=true}}}
+    c.state.server='http://B';c.state.token='token-b'
+    for(const run of tasks)run()
+    assert.equal(aborted,true);assert.equal(c.state.current,null)
+    assert.deepEqual(views,[file.includes('desktop')?'view-sessions':'view-home'])
+  })
   test(file + ': connection generation rejects ABA and token-only changes', () => {
     const { context: c } = fixture(file)
     const first = c.captureConnection(); c.state.server = 'http://B'; c.state.server = 'http://A'
@@ -47,11 +62,13 @@ for (const file of sources) {
     c.state.questionModal = c.state.questions[0]; c.state.queues = { same: ['queued-A'] }
     c.state.compactions = { same: { active: true } }; c.state.pendingCommands = { same: 'compact' }
     c.state.models.loading = true; c.state.sessionActivity.add('same')
+    c.state.subagentSessions = { child: { sessionId: 'child', parentSessionId: 'private-A' } }
     c.state.server = 'http://B'
     assert.equal(c.state.approvals.length, 0); assert.equal(c.state.questions.length, 0); assert.equal(c.state.questionModal, null)
     assert.equal(Object.keys(c.state.queues).length, 0); assert.equal(Object.keys(c.state.compactions).length, 0)
     assert.equal(Object.keys(c.state.pendingCommands).length, 0); assert.equal(c.state.models.loading, false)
     assert.equal(c.state.sessionActivity.size, 0)
+    assert.equal(Object.keys(c.state.subagentSessions).length, 0)
   })
   test(file + ': late session response cannot replace a new connection or a newer request', async () => {
     const { context: c, source } = fixture(file)
@@ -126,7 +143,7 @@ for (const file of sources) {
       mutations.push({ server: c.state.server, path: payload.path }); return { workspace: { workspaceId: 'created' } }
     }
     vm.runInContext(section(source, 'async function refreshWorkbench('), c)
-    const resync = c.refreshWorkbench(); await reached.promise
+    const resync = c.refreshWorkbench({ discover: true }); await reached.promise
     c.state.server = 'http://B'
     listing.resolve({ ok: true, json: async () => ({ entries: [{ name: 'old-project', type: 'dir' }] }) }); await resync
     assert.equal(mutations.length, 0)

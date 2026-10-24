@@ -23,6 +23,55 @@ function domFixture(){
  return {box,view,api,flush:()=>{for(const [id,fn]of [...frames]){frames.delete(id);fn()}}}
 }
 const entries=(start,count)=>Array.from({length:count},(_,i)=>({seq:start+i,event:{type:'assistant/message',data:{text:'message '+(start+i)}}}))
+test('A bad row cannot blank other messages, and retry can render the identical entry again',()=>{
+ const {box,view}=domFixture(),all=entries(1,3);let fail=true
+ view.options.html=entry=>{if(entry.seq===2&&fail)throw Error('malformed message');return String(entry.seq)};view.options.retry=()=>{}
+ assert.doesNotThrow(()=>view.set(all,{reset:true}));assert.equal(view.renderErrors,1);assert.equal(box.querySelectorAll().length,3);assert.ok(box.children.includes(view.retry));assert.equal(view.suppress,true)
+ fail=false;view.set(all);assert.equal(view.renderErrors,0);assert.ok(!box.children.includes(view.retry))
+})
+
+test('CRLF cache restore, paging to old poison rows and reopening retain text without renderer errors',async()=>{
+ const storage=new Map(),context=vm.createContext({module:{exports:{}},globalThis:{},Date,JSON,Map,Set,WeakMap,Promise,localStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value)}})
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../public/history.js'),'utf8'),context,{timeout:1000})
+ const cache=context.module.exports,render=require('./fixtures/bounded-markdown.cjs')(),all=entries(1,420)
+ for(const seq of [1,60,61,180,181,240,241,420])all[seq-1].event.data.text='para\r\n# KEEP_'+seq+'\r\n> quote\r\n- item\r'
+ const original=JSON.stringify(all)
+ assert.equal(await cache.cacheSave('fixture','issue22',{events:all}),true)
+ for(let reopen=0;reopen<2;reopen++){
+  const restored=await cache.cacheLoad('fixture','issue22'),{view,box,flush}=domFixture(),seen=new Set()
+  assert.equal(JSON.stringify(restored.events),original)
+  view.options.html=entry=>{seen.add(entry.seq);return render(entry.event.data.text)}
+  const check=()=>{flush();assert.equal(view.renderErrors,0);assert.ok(box.querySelectorAll().length<=H.WINDOW_SIZE);for(const node of box.querySelectorAll()){const seq=Number(node.dataset.historySeq);if(all[seq-1].event.data.text.includes('KEEP_'))assert.ok(node.innerHTML.includes('<h1>KEEP_'+seq+'</h1>'))}}
+  view.set(restored.events,{reset:true});check();assert.ok(!seen.has(1),'oldest poison row initially outside window')
+  while(view.start>0){box.scrollTop=0;view.intentUntil=Date.now()+1000;await view.older();check()}
+  assert.ok(seen.has(1));assert.equal(seen.size,420)
+  view.latest();check();assert.equal(view.end,420)
+ }
+ assert.equal(JSON.stringify(all),original,'rendering never rewrites the caller cache data')
+})
+
+test('issue 18: nonempty records with no renderable rows show a diagnostic and a working retry',()=>{
+ const {view,box}=domFixture();let retries=0
+ view.options.html=()=>'';view.options.unreadableLabel=()=> 'History could not be displayed';view.options.retry=()=>retries++
+ view.set(entries(1,492),{reset:true,emptyLabel:'No messages'})
+ assert.ok(box.children.includes(view.empty));assert.equal(view.empty.textContent,'History could not be displayed');assert.ok(box.children.includes(view.retry))
+ view.retry.fire('click');assert.equal(retries,1)
+ view.options.html=entry=>String(entry.seq);view.set(entries(1,1),{reset:true,emptyLabel:'No messages'});assert.ok(!box.children.includes(view.empty));assert.ok(!box.children.includes(view.retry))
+})
+test('activity expansion survives live HTML replacement and is cleared when changing conversations',()=>{
+ const {box,view,flush}=domFixture(),query=box.querySelectorAll.bind(box)
+ let html='',detail
+ Object.defineProperty(view.live,'innerHTML',{get:()=>html,set:value=>{html=value;detail=value?{dataset:{activityKey:'reasoning-1'},open:false}:null}})
+ view.live.querySelectorAll=()=>detail?[detail]:[]
+ box.querySelectorAll=selector=>selector==='details[data-activity-key]'?(detail?[detail]:[]):query(selector)
+ view.set(entries(1,1),{reset:true,live:'first thought'});flush();assert.equal(detail.open,false)
+ detail.open=true;box.fire('toggle',{target:detail})
+ view.set(view.entries,{live:'updated thought'});flush();assert.equal(detail.open,true)
+ detail.open=false;box.fire('toggle',{target:detail})
+ view.set(view.entries,{live:'another thought'});flush();assert.equal(detail.open,false)
+ view.reset();assert.equal(view.disclosures.size,0)
+ view.set(entries(1,1),{reset:true,live:'different conversation'});flush();assert.equal(detail.open,false)
+})
 test('10,000 history records remain bounded while paging up and back down',async()=>{
  const {box,view,flush}=domFixture(),all=entries(1,10000);view.set(all,{reset:true});flush()
  let moves=0
@@ -96,8 +145,8 @@ test('Reconciliation replaces changed entries, removes absent authoritative entr
 })
 function loaderFixture(file){
  const source=fs.readFileSync(path.join(__dirname,'../public',file),'utf8'),start=source.indexOf('async function loadHistory('),end=source.indexOf(file==='app.js'?'function insertLiveEvent(':'const INTERESTING_EVENTS',start)
- const state={current:'a',history:{visible:entries(10,3),minSeq:10,partialReasoning:new Map(),reasoningVersion:0,hasMore:true}},calls=[],renders=[];let resolve,reject,valid=true
- const context=vm.createContext({state,Date,Number,Map,Set,Math,window:{DshHistory:H},captureConnection:()=>({valid:()=>valid}),getConversationView:()=>({more:{},options:{loadingLabel:()=>''}}),rpc:(_,payload)=>{calls.push(payload);return new Promise((a,b)=>{resolve=a;reject=b})},historySource:value=>{state.history.source=value},setSessionRecovery:()=>{},hydrateSessionProjections:()=>{},applyReasoningStreamEvent:()=>{},noteSessionTurnTime:()=>{},shouldShowEvent:type=>!['session/title','title'].includes(type),trimVisible:()=>{},applyReasoningBaseline:()=>{},renderSessionTitle:()=>{},renderSessionSub:()=>{},renderSessionCards:()=>{},updateSessionActions:()=>{},renderHistory:(...args)=>renders.push(args),scheduleHistoryCacheSave:()=>{},document:{createElement:()=>({addEventListener:(_,fn)=>{context.retry=fn}})},$:()=>({innerHTML:'',textContent:'',append:()=>{}}),t:()=>'',esc:x=>x,authFailure:()=>{}})
+ const state={byId:new Map(),current:'a',history:{visible:entries(10,3),minSeq:10,partialReasoning:new Map(),reasoningVersion:0,hasMore:true}},calls=[],renders=[];let resolve,reject,valid=true
+ const context=vm.createContext({state,Date,Number,Map,Set,Math,AbortController,clearTimeout,window:{DshHistory:H,DshNetwork:require('../public/network.js')},captureConnection:()=>({valid:()=>valid}),getConversationView:()=>({more:{},options:{loadingLabel:()=>''}}),rpc:(_,payload)=>{calls.push(payload);return new Promise((a,b)=>{resolve=a;reject=b})},historySource:value=>{state.history.source=value},setSessionRecovery:()=>{},hydrateSessionProjections:()=>{},applyReasoningStreamEvent:()=>{},noteSessionTurnTime:()=>{},shouldShowEvent:type=>!['session/title','title'].includes(type),trimVisible:()=>{},applyReasoningBaseline:()=>{},renderSessionTitle:()=>{},renderSessionSub:()=>{},renderSessionCards:()=>{},updateSessionActions:()=>{},renderHistory:(...args)=>renders.push(args),scheduleHistoryCacheSave:()=>{},collectApprovalEvent:()=>false,renderApprovalRecords:()=>{},renderApprovalRecordsDesktop:()=>{},document:{createElement:()=>({addEventListener:(_,fn)=>{context.retry=fn}})},$:()=>({innerHTML:'',textContent:'',append:()=>{}}),t:()=>'',esc:x=>x,authFailure:()=>{}})
  context.conversationView={reading:true}
  vm.runInContext(source.slice(source.indexOf('function trimVisible('),start)+source.slice(start,end),context)
  return {state,calls,renders,load:context.loadHistory,resolve:value=>resolve(value),reject:error=>reject(error),invalidate:()=>{valid=false},setReading:value=>{context.conversationView.reading=value},retry:()=>context.retry()}
@@ -157,4 +206,16 @@ test('IndexedDB transaction failure falls back to local storage, evicting older 
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../public/history.js'),'utf8'),context)
  assert.equal(await context.module.exports.cacheSave('scope','new',{events:entries(1,3)}),true)
  assert.equal(data.has('scope:session:old'),false);assert.ok(data.has('scope:session:new'))
+})
+
+test('a stalled IndexedDB read falls back to local storage within its deadline',async()=>{
+ const timers=new Map();let seq=0,request,aborted=false
+ const db={transaction:()=>({abort:()=>{aborted=true},objectStore:()=>({get:()=>request={}})})}
+ const indexedDB={open:()=>{const open={result:db};queueMicrotask(()=>open.onsuccess());return open}}
+ const c=vm.createContext({module:{exports:{}},globalThis:{},indexedDB,localStorage:{getItem:()=>JSON.stringify({events:[{seq:7}]})},setTimeout:fn=>{timers.set(++seq,fn);return seq},clearTimeout:id=>timers.delete(id),queueMicrotask,Date,JSON,Map,Set,WeakMap})
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../public/history.js'),'utf8'),c)
+ const pending=c.module.exports.cacheLoad('scope','same');await new Promise(setImmediate)
+ assert.equal(timers.size,1);timers.values().next().value()
+ const value=await pending;assert.equal(value.events[0].seq,7);assert.equal(aborted,true);assert.equal(timers.size,0)
+ request.result={events:[{seq:1}]};request.onsuccess();assert.equal(value.events[0].seq,7)
 })

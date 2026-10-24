@@ -12,10 +12,16 @@ import net from 'node:net'
 import { homedir, hostname, networkInterfaces } from 'node:os'
 import { dirname, extname, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 import { createPluginCenter, detectProfile } from './plugin-center.mjs'
 import { readCostInsights } from './insights.mjs'
+import { readTeamInsights } from './teams.mjs'
+import { readTaskBoard } from './task-board.mjs'
+import { readPeakReminders } from './peak-reminders.mjs'
 import { serveSessionFile } from './session-file.mjs'
 import { createSkillsAdapter } from './skills.mjs'
+import { registerDoctorSkill } from './doctor-skill.mjs'
+import { readDoctorTarget, watchDoctorWorkspaces } from './doctor-target.mjs'
 
 export const name = 'dsh-remote'
 export const inject = ['webServer', 'commands', 'agents', 'connection']
@@ -183,16 +189,20 @@ function sendJson(res, status, body) {
 
 function readBody(req, maxBytes) {
   return new Promise((resolvePromise, reject) => {
-    let body = ''
+    const chunks = []; let size = 0, settled = false
     req.on('data', (chunk) => {
-      body += chunk
-      if (body.length > maxBytes) {
-        reject(new Error('body too large'))
-        req.destroy()
+      if (settled) return
+      size += chunk.length
+      if (size > maxBytes) {
+        settled = true; chunks.length = 0
+        reject(Object.assign(new Error('body too large'), { status: 413 }))
+        return
       }
+      chunks.push(chunk)
     })
-    req.on('end', () => resolvePromise(body))
+    req.on('end', () => { if (!settled) { settled = true; resolvePromise(Buffer.concat(chunks).toString('utf8')) } })
     req.on('error', reject)
+    req.once('aborted', () => reject(Object.assign(new Error('request aborted'), { status: 400 })))
   })
 }
 
@@ -209,7 +219,7 @@ async function proxyGateway(path, method, body) {
         'x-dsh-remote-client': 'admin',
       },
       body: method === 'POST' ? body : undefined,
-      signal: AbortSignal.timeout(path.startsWith('/admin/api/dsh') ? 15000 : 5000),
+      signal: AbortSignal.timeout(path === '/admin/api/relay' ? 18000 : path.startsWith('/admin/api/dsh') ? 15000 : 5000),
     })
     const json = await res.json().catch(() => ({ ok: false, error: `gateway ${res.status}` }))
     return { status: res.status, json }
@@ -292,13 +302,20 @@ async function probeGatewayRunning(base) {
     const res = await fetch(`${base}/health?probe=live`, { signal: AbortSignal.timeout(6000) })
     if (!res.ok) return { running: false }
     const data = await res.json().catch(() => ({}))
-    if (data.service !== 'dsh-remote' || !Number.isInteger(data.pid) || data.pid <= 1
-      || typeof data.version !== 'string' || typeof data.upstream !== 'string'
-      || !data.events?.mux || !data.events?.host) return { running: false }
+    // Early 0.7.x live probes deliberately omit readiness/upstream fields.
+    // Recognize that exact compact shape without invoking the old, blocking
+    // full health check. Public health never authorizes a PID kill: takeover
+    // still requires the existing token and /admin/api/shutdown below.
+    const compact = data.ok === true && data.probe === 'live' && data.liveness?.ok === true
+      && !Object.hasOwn(data, 'pid') && !Object.hasOwn(data, 'upstream') && !Object.hasOwn(data, 'events')
+    const pid = compact ? data.liveness.pid : data.pid
+    if (data.service !== 'dsh-remote' || !Number.isInteger(pid) || pid <= 1
+      || typeof data.version !== 'string' || !data.version
+      || (!compact && (typeof data.upstream !== 'string' || !data.events?.mux || !data.events?.host))) return { running: false }
     return {
       running: true,
       base,
-      pid: Number(data.pid) || 0,
+      pid,
       version: typeof data.version === 'string' ? data.version : '',
       upstream: typeof data.upstream === 'string' ? data.upstream : '',
       upstreamOk: data.upstreamOk === true,
@@ -414,6 +431,11 @@ async function startGateway() {
 
   // 无 systemd 的机器回退: detached 子进程
   if (!sysd) {
+    // Windows locks a process's current directory. Keep both supervisor and
+    // worker outside the replaceable node_modules package during self-update.
+    const gatewayCwd = `${homedir()}/.dsh-remote`
+    try { mkdirSync(gatewayCwd, { recursive: true }) }
+    catch { return { ok: false, running: false, error: '无法创建网关运行目录，请检查用户目录权限' } }
     let logFd = null
     try {
       logFd = openSync(`${homedir()}/.dsh-remote/plugin-gateway.log`, 'a')
@@ -422,7 +444,7 @@ async function startGateway() {
     delete gatewayEnv.NODE_CHANNEL_FD
     delete gatewayEnv.NODE_CHANNEL_SERIALIZATION_MODE
     const child = spawn(process.execPath, [script, '--supervise'], {
-      cwd: dirname(script),
+      cwd: gatewayCwd,
       detached: true,
       stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
       env: gatewayEnv,
@@ -552,7 +574,7 @@ async function resolveAgent(ctx, sessionId) {
     if (!handle || !handle.agent) return { agent: null, resolvePath: 'resume-empty-handle' }
     return { agent: handle.agent, resolvePath: 'resume' }
   } catch (e) {
-    return { agent: null, resolvePath: 'resume-error: ' + (e?.message || String(e)) }
+    return { agent: null, resolvePath: 'resume-error' }
   }
 }
 
@@ -581,12 +603,14 @@ function remoteCommandAuthorized(req) {
 function commandOperationSnapshot(operation) {
   if (!operation) return { active: false, phase: 'idle', command: '', startedAt: 0, endedAt: 0, message: '' }
   return {
+    id: operation.id,
     active: operation.active === true,
     phase: operation.phase || 'idle',
     command: String(operation.command || ''),
     startedAt: Number(operation.startedAt) || 0,
     endedAt: Number(operation.endedAt) || 0,
     message: String(operation.message || ''),
+    ...(typeof operation.executed === 'boolean' ? { executed: operation.executed } : {}),
   }
 }
 
@@ -598,8 +622,11 @@ async function executeRegisteredCommand(ctx, agent, line, signal) {
 
 function beginCommandOperation(ctx, agent, sessionId, line, command) {
   const existing = commandOperations.get(sessionId)
-  if (existing?.active) return { operation: existing, reused: true }
-  const operation = { active: true, phase: 'running', command, startedAt: Date.now(), endedAt: 0, message: '' }
+  if (existing?.active) {
+    if (existing.line !== line) throw new Error('当前会话已有命令正在执行，请等待完成后再提交。')
+    return { operation: existing, reused: true }
+  }
+  const operation = { id: randomUUID(), active: true, phase: 'running', command, line, startedAt: Date.now(), endedAt: 0, message: '' }
   commandOperations.set(sessionId, operation)
   // 不把已登记命令绑定到 HTTP 超时：真实 command/done 才是完成边界。
   // 处理器仍接收可用 AbortSignal，以符合命令执行器的契约。
@@ -607,13 +634,14 @@ function beginCommandOperation(ctx, agent, sessionId, line, command) {
   void executeRegisteredCommand(ctx, agent, line, signal).then((result) => {
     operation.active = false
     operation.endedAt = Date.now()
-    operation.phase = result?.result?.kind === 'error' ? 'failed' : 'complete'
-    operation.message = String(result?.result?.text || '')
+    operation.executed = commandWasExecuted(result)
+    operation.phase = !operation.executed || result?.result?.kind === 'error' ? 'failed' : 'complete'
+    operation.message = operation.phase === 'failed' ? (operation.executed ? 'command-failed' : 'command-not-executed') : String(result?.result?.text || '').slice(0, 2000)
   }, (error) => {
     operation.active = false
     operation.endedAt = Date.now()
     operation.phase = 'failed'
-    operation.message = error?.message || String(error)
+    operation.message = 'command-failed'
   }).finally(() => {
     const cleanup = setTimeout(() => {
       if (commandOperations.get(sessionId) === operation && !operation.active) commandOperations.delete(sessionId)
@@ -624,7 +652,9 @@ function beginCommandOperation(ctx, agent, sessionId, line, command) {
 }
 
 async function resolveFile(pathname) {
-  let abs = targetPath(pathname)
+  // 安装包在 public/ 之外，精确映射此文件，不能开放整个插件目录。
+  let abs = pathname === `${MOUNT}/dsh-remote.apk`
+    ? fileURLToPath(new URL('./apk/dsh-remote.apk', import.meta.url)) : targetPath(pathname)
   if (abs === null) return null
   try {
     let info = await stat(abs)
@@ -652,8 +682,39 @@ async function resolveFile(pathname) {
   }
 }
 
+// Read metadata inside the actual DSH Host, never from the gateway's cwd/version.
+export function hostDescription(ctx, runtime = process) {
+  let dshVersion = null, attachedSessions = null
+  const profile = detectProfile(ctx, runtime.argv[1], runtime)
+  if (profile?.cli) {
+    try {
+      const pkg = JSON.parse(readFileSync(resolve(dirname(profile.cli), '../package.json'), 'utf8'))
+      const expected = profile.cliMode === 'desktop' ? '@deepseek-ai/dsh-desktop-host' : '@deepseek-ai/dsh'
+      if (pkg.name === expected && typeof pkg.version === 'string') dshVersion = pkg.version.slice(0, 100)
+    } catch {}
+  }
+  try {
+    const agents = ctx.agents.list()
+    if (Array.isArray(agents)) attachedSessions = agents.length
+  } catch {}
+  return { version: dshVersion, cwd: runtime.cwd(), attachedSessions, home: homedir(), canOpenPath: false, metadataOnly: true }
+}
+
 async function serveStatic(req, res, ctx) {
   const pathname = new URL(req.url ?? '/', 'http://x').pathname
+  if (pathname === `${MOUNT}/api/doctor/target` || pathname === `${MOUNT}/admin/api/doctor-target`) {
+    res.setHeader('cache-control','no-store')
+    if(pathname===`${MOUNT}/api/doctor/target` && !remoteCommandAuthorized(req))return sendJson(res,401,{ok:false,code:'unauthorized'})
+    if(req.method!=='GET')return sendJson(res,405,{ok:false,code:'read-only'})
+    if([...new URL(req.url,'http://x').searchParams].length)return sendJson(res,400,{ok:false,code:'invalid-query'})
+    return sendJson(res,200,readDoctorTarget(ctx))
+  }
+  if (pathname === `${MOUNT}/api/host-description`) {
+    res.setHeader('cache-control', 'no-store')
+    if (!remoteCommandAuthorized(req)) return sendJson(res, 401, { ok: false, code: 'unauthorized' })
+    if (req.method !== 'GET') return sendJson(res, 405, { ok: false, code: 'method-not-allowed' })
+    return sendJson(res, 200, { ok: true, ...hostDescription(ctx) })
+  }
   if (pathname.startsWith(`${MOUNT}/api/skills/`)) {
     res.setHeader('cache-control', 'no-store')
     if (!remoteCommandAuthorized(req)) return sendJson(res, 401, { ok: false, code: 'unauthorized' })
@@ -676,6 +737,35 @@ async function serveStatic(req, res, ctx) {
     const result = await adapter.handle(req.method, pathname.slice(`${MOUNT}/api/skills`.length), url.searchParams)
     return sendJson(res, result.status, result.body)
   }
+  if (pathname === `${MOUNT}/api/task-board`) {
+    res.setHeader('cache-control', 'no-store')
+    if (!remoteCommandAuthorized(req)) return sendJson(res, 401, { ok: false, code: 'unauthorized' })
+    if (req.method !== 'GET') return sendJson(res, 405, { ok: false, code: 'read-only' })
+    const result = await readTaskBoard(ctx, new URL(req.url, 'http://x').searchParams)
+    return sendJson(res, result.status, result.body)
+  }
+  if (pathname === `${MOUNT}/api/teams`) {
+    res.setHeader('cache-control', 'no-store')
+    if (!remoteCommandAuthorized(req)) return sendJson(res, 401, { ok: false, code: 'unauthorized' })
+    if (req.method !== 'GET') return sendJson(res, 405, { ok: false, code: 'read-only' })
+    const result = await readTeamInsights(ctx, new URL(req.url, 'http://x').searchParams, async archived => {
+      let cookie = ''
+      try { cookie = readFileSync(dshUpstreamCookieFile(), 'utf8').trim() } catch {}
+      if (cookie.length > 4096 || /[\x00-\x1f]/.test(cookie)) cookie = ''
+      return fetch(upstreamUrlForListener(dshListen) + '/plugins/dsh-agent-teams/state' + (archived ? '?archived=1' : ''), {
+        headers: cookie ? { cookie } : {}, redirect: 'error', signal: AbortSignal.timeout(20000)
+      })
+    })
+    return sendJson(res, result.status, result.body)
+  }
+  if (pathname === `${MOUNT}/api/insights/peak-reminders`) {
+    res.setHeader('cache-control', 'no-store')
+    if (!remoteCommandAuthorized(req)) return sendJson(res, 401, { ok: false, code: 'unauthorized' })
+    if (req.method !== 'GET') return sendJson(res, 405, { ok: false, code: 'read-only' })
+    if ([...new URL(req.url, 'http://x').searchParams].length) return sendJson(res, 400, { ok: false, code: 'invalid-query' })
+    const result = await readPeakReminders(ctx)
+    return sendJson(res, result.status, result.body)
+  }
   if (pathname === `${MOUNT}/api/insights/cost`) {
     if (!remoteCommandAuthorized(req)) return sendJson(res, 401, { ok: false, code: 'unauthorized' })
     if (req.method !== 'GET') return sendJson(res, 405, { ok: false, code: 'read-only' })
@@ -686,6 +776,7 @@ async function serveStatic(req, res, ctx) {
     return sendJson(res, result.status, result.body)
   }
   if (pathname.startsWith(`${MOUNT}/api/plugins/`)) {
+    res.setHeader('cache-control', 'no-store')
     if (!remoteCommandAuthorized(req)) return sendJson(res, 401, { ok: false, message: 'unauthorized' })
     try {
       const url = new URL(req.url, 'http://x')
@@ -711,7 +802,16 @@ async function serveStatic(req, res, ctx) {
     return
   }
 
-  // 统计面板数据: 代理到本地网关 /stats/*(网关未运行则返回 502)
+  // The embedded panel is already authenticated by the DSH web listener,
+  // like the adjacent admin/state route. Read cost-meter without a gateway.
+  if (pathname === `${MOUNT}/admin/api/cost`) {
+    res.setHeader('cache-control', 'no-store')
+    if (req.method !== 'GET') return sendJson(res, 405, { ok: false, code: 'read-only' })
+    const result = await readCostInsights(ctx)
+    return sendJson(res, result.status, result.body)
+  }
+
+  // Legacy stats API retained for older clients.
   if (pathname === `${MOUNT}/admin/api/stats/summary` || pathname === `${MOUNT}/admin/api/stats/detail`) {
     const query = new URL(req.url ?? '/', 'http://x').search
     const sub = pathname.slice(`${MOUNT}/admin/api/stats`.length)
@@ -793,6 +893,13 @@ async function serveStatic(req, res, ctx) {
     [`${MOUNT}/admin/api/device-keys/rotate`, '/device-keys/rotate'],
     [`${MOUNT}/admin/api/device-keys/revoke`, '/device-keys/revoke'],
   ])
+  if (pathname === `${MOUNT}/admin/api/relay` || pathname === `${MOUNT}/admin/api/autostart`) {
+    if (!['GET', 'POST'].includes(req.method)) { res.writeHead(405, { allow: 'GET, POST' }); res.end(); return }
+    const body = req.method === 'POST' ? await readBody(req, 4096) : undefined
+    const proxied = await proxyGateway(pathname.endsWith('/autostart') ? '/admin/api/autostart' : '/admin/api/relay', req.method, body)
+    sendJson(res, proxied?.status || 502, proxied?.json || { error: 'GATEWAY_UNAVAILABLE' })
+    return
+  }
   if (gatewayAdminMutations.has(pathname)) {
     if (req.method !== 'POST') {
       res.writeHead(405, { allow: 'POST' })
@@ -942,8 +1049,8 @@ async function serveStatic(req, res, ctx) {
     let body
     try {
       body = JSON.parse((await readBody(req, 8192)) || '{}')
-    } catch {
-      sendJson(res, 400, { ok: false, message: 'invalid json' })
+    } catch (error) {
+      sendJson(res, error.status === 413 ? 413 : 400, { ok: false, message: error.status === 413 ? 'body too large' : 'invalid json' })
       return
     }
     const { sessionId, line } = body || {}
@@ -964,7 +1071,7 @@ async function serveStatic(req, res, ctx) {
         commandEntries = Array.isArray(listed) ? listed : null
         commandNames = commandEntries ? commandEntries.map(commandEntryName).filter(Boolean) : []
       } catch (e) {
-        commandNames = ['list-error: ' + (e?.message || String(e))]
+        commandNames = ['list-error']
       }
       const name = commandHead(line)
       if (commandEntries && (!name || !commandEntries.some(entry => commandEntryName(entry) === name))) {
@@ -975,7 +1082,7 @@ async function serveStatic(req, res, ctx) {
       }
       // /export 的成功结果必须先回到客户端，由客户端再发起 ZIP 下载；其他已登记
       // 命令统一异步受理，避免把未知耗时绑定到一条 HTTP 请求。
-      if (name && name !== 'export') {
+      if (name && (name !== 'export' || body.async === true)) {
         const { operation, reused } = beginCommandOperation(ctx, agent, sessionId, line, name)
         sendJson(res, 202, {
           ok: true,
@@ -994,7 +1101,7 @@ async function serveStatic(req, res, ctx) {
       const result = await executeRegisteredCommand(ctx, agent, line, signal)
       sendJson(res, 200, { ok: true, executed: commandWasExecuted(result), debug: { resolvePath, commandNames } })
     } catch (e) {
-      sendJson(res, 200, { ok: false, message: e?.message || String(e) })
+      sendJson(res, 200, { ok: false, message: 'command-failed' })
     }
     return
   }
@@ -1020,7 +1127,8 @@ async function serveStatic(req, res, ctx) {
     return
   }
   res.writeHead(200, {
-    'content-type': MIME[extname(abs)] ?? 'application/octet-stream',
+    'content-type': extname(abs) === '.apk' ? 'application/vnd.android.package-archive' : MIME[extname(abs)] ?? 'application/octet-stream',
+    ...(extname(abs) === '.apk' ? { 'content-disposition': 'attachment; filename="dsh-remote.apk"', 'x-content-type-options': 'nosniff' } : {}),
     'content-length': info.size,
     'cache-control': 'no-cache',
     'last-modified': lastModified,
@@ -1029,7 +1137,10 @@ async function serveStatic(req, res, ctx) {
     res.end()
     return
   }
-  createReadStream(abs).pipe(res)
+  const stream = createReadStream(abs)
+  stream.on('error', () => res.destroy())
+  res.on('close', () => stream.destroy())
+  stream.pipe(res)
 }
 
 const pluginCenters = new WeakMap()
@@ -1082,10 +1193,19 @@ export function apply(ctx) {
   dshListen = { host: ctx.webServer.host, port: ctx.webServer.port }
   dshConnection = ctx.connection
   saveDshLaunchConfig(ctx)
+  // Optional on older DSH: register the packaged read-only doctor skill when
+  // the host exposes a skill registry. Failure never blocks the plugin.
+  registerDoctorSkill(ctx)
+  watchDoctorWorkspaces(ctx)
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: MOUNT,
-    handler: (req, res) => serveStatic(req, res, ctx),
+    handler: (req, res) => serveStatic(req, res, ctx).catch(error => {
+      if (res.writableEnded || res.destroyed) return
+      if (res.headersSent) return res.destroy()
+      if (error.status === 413) res.setHeader('connection', 'close')
+      sendJson(res, error.status || (error instanceof SyntaxError ? 400 : 500), { ok: false, message: error.status === 413 ? 'body too large' : 'request-failed' })
+    }),
   }), 'dsh-remote: /remote route')
   // 实时统计: 监听 DSH 会话事件流, 把带 usage 的 assistant/message 投递到网关聚合
   ctx.on('session/event', (session, event) => {

@@ -1,12 +1,12 @@
 # Android 壳与后台服务模块
 
-> 源码核对：2026-10-12，仓库 0.7.4。应用 ID：`com.dshremote.app`。
+> 源码核对：2026-10-17，仓库 0.8.0-rc.3。应用 ID：`com.dshremote.app`。
 >
 > [模块索引](README.md) · [使用与平台差异](../usage.md)
 
 ## 1. 模块定位
 
-Capacitor WebView 承载根 `public/`，系统层负责下载、安装、inset、后台轮询、通知、峰谷提醒和 deep link。功能测试页保留导航，Android 的 ASR 页面、SpeechRecognizer 桥和麦克风权限已移除；鸿蒙的诊断是独立实现。
+Capacitor WebView 承载根 `public/`，系统层负责下载、安装、inset、后台轮询、通知和 deep link；峰谷提醒使用主机 `dsh-cost-meter` 的规则，由 Android 接收器发送通知。功能测试页保留导航，Android 的 ASR 页面、SpeechRecognizer 桥和麦克风权限已移除；鸿蒙的诊断是独立实现。
 
 ## 2. 代码结构
 
@@ -14,7 +14,7 @@ Capacitor WebView 承载根 `public/`，系统层负责下载、安装、inset�
 | --- | --- |
 | `android/app/src/main/java/com/dshremote/app/MainActivity.java` | WebView、UpdateBridge、BackgroundBridge |
 | 同目录 `RemotePollService.java` | 双通道事件轮询、后台通知、gzip 解码 |
-| 同目录 `PeakReminderService.java` | 北京时间峰谷提醒 |
+| 同目录 `PeakReminderService.java`、`PeakReminderPolicy.java` | 从主机更新峰谷通知时间表，后台发送、去重、限时补发和过期停用 |
 | `android/app/src/main/AndroidManifest.xml` | 网络、相机/通知、安装、服务和 deep link |
 | `android/app/build.gradle`、`android/variables.gradle` | 版本、SDK、现有依赖和侧载签名 |
 | 根 `capacitor.config.json` | Web 资源入口 |
@@ -23,7 +23,7 @@ Capacitor WebView 承载根 `public/`，系统层负责下载、安装、inset�
 
 - 相机/相册由已有 Capacitor 能力提供，配对 deep link 交给 WebUI。
 - 系统 Downloads 文件下载，APK 进度/速度、SHA-256 校验与安装器。
-- 后台轮询与任务完成通知；峰谷提醒独立开关。
+- 后台轮询与任务完成通知；峰谷时间在 DSH「设置 → 费用 → 峰谷计价」配置（`dsh-cost-meter`），手机本地开关决定是否发送 Android 通知，升级清理旧固定通知计划。
 - Android 最低 SDK 24，compile/target SDK 36，构建使用 JDK 21。
 
 ## 4. 具体实现方式
@@ -32,7 +32,7 @@ MainActivity 注册三个 JS 对象：`NativeUpdate`、`NativeFile` 复用 Updat
 
 RemotePollService 的 SharedPreferences 为 `dsh_remote_bg`；mux/host 独立轮询，保存 seq，401 达阈值后标记失效并停止。网络恢复补查，接受 gzip。Doze/厂商后台限制会延迟，前台服务不能保证无限保活。
 
-峰谷服务每 30 秒检查北京时间，工作日 9/12/14/18 点，周末 9 点；占位防重复，通知失败回滚。云端公告与投票不是该服务的职责。
+`PeakReminderService` 每 5 分钟读取认证只读接口 `/remote/api/insights/peak-reminders`，每 30 秒检查有效缓存中的变化点，不再写死 9/12/14/18 点。旧通知 8801–8804 在启动时取消，当前通知使用独立渠道。接收器重启不重复发出已成功通知的变化点，断网时仅用有效期内缓存，晚到最多补发 30 分钟。具体接口、限制和验收见[峰谷通知与 issue #18](../peak-reminders-and-issue18.md)。鸿蒙端仍是自己的代理提醒实现。云端公告与投票不是该服务的职责。
 
 ## 5. 制作目的
 
@@ -43,12 +43,12 @@ RemotePollService 的 SharedPreferences 为 `dsh_remote_bg`；mux/host 独立轮
 | JS 对象 | 方法 |
 | --- | --- |
 | `NativeUpdate` | `getInsets()`、`getDownloadStatus()`、`downloadAndInstall(url)`、`downloadVerifiedAndInstall(url,expectedHash)` |
-| `NativeFile` | `downloadToDownloads(url,name,token)` |
-| `NativeBackground` | `saveBackgroundConfig(json)`、`getBackgroundConfig()`、`startPeakReminder()`、`stopPeakReminder()` |
+| `NativeFile` | `downloadToDownloads(url,name,token)`、`exportDiagnostics(json)`、`getDiagnosticExportStatus()` |
+| `NativeBackground` | `saveBackgroundConfig(json)`、`getBackgroundConfig()`、`savePeakReminderConfig(json)`、`getPeakReminderConfig()`；旧 `startPeakReminder()` 仅恢复已有插件规则配置，`stopPeakReminder()` 停止提醒 |
 
 后台配置包含启用、间隔、base、token、clientId 与任务完成通知设置。凭证只用于本地请求，不进入通知/日志。桥接存在性必须先检查；下载状态回调按生产实现处理，不以旧方法推断新壳能力。
 
-版本从根 package 读取；RC versionName 连字符转点。versionCode 的 RC 槽限制与签名策略见[构建发布](../release.md)。目前使用仓库侧载 debug 签名，不能表述成商店正式签名。
+版本从根 package 读取；RC versionName 连字符转点。versionCode 的独立发布计数与签名策略见[构建发布](../release.md)。目前使用仓库侧载 debug 签名，不能表述成商店正式签名。
 
 ## 7. 边界与禁止事项
 
@@ -56,7 +56,7 @@ RemotePollService 的 SharedPreferences 为 `dsh_remote_bg`；mux/host 独立轮
 
 ## 8. 测试与验收
 
-`tests/apk-progress.test.js` 验证下载与桥契约，`asr-test-ui.test.js` 验证 Android ASR 已移除，`mobile-select-peak-reminder.test.js` 验证提醒。构建见[开发指南](../development.md)，真机单独检查扫码、权限、通知、深链、安装/升级、后台与弱网。
+`tests/apk-progress.test.js` 验证下载与桥契约，`asr-test-ui.test.js` 验证 Android ASR 已移除，`mobile-select-peak-reminder.test.js`、`peak-reminders.test.js`、`android-background.test.js` 验证插件规则、手机开关、旧通知清理、发送边界与后台状态。构建见[开发指南](../development.md)，真机单独检查扫码、权限、通知、深链、安装/升级、后台与弱网。
 
 ## 9. 修改前检查清单
 
@@ -67,4 +67,4 @@ RemotePollService 的 SharedPreferences 为 `dsh_remote_bg`；mux/host 独立轮
 
 ## 10. 未决事项
 
-后台可靠性取决于 Android 和 ROM。RC 次数超过当前版本槽时的 versionCode 升级策略仍需实现层处理；本轮文档不修改公式。
+后台可靠性取决于 Android 和 ROM。versionCode 已改为独立发布计数，同版本重建不递增、新版本发布加一；计数校验、旧码过渡及真机升级验收见[构建发布](../release.md)。

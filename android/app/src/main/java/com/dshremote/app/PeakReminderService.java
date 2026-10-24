@@ -13,202 +13,190 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
-
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
-import java.util.Calendar;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
 
-/**
- * 峰谷计费提醒前台服务。
- *
- * 用前台服务进程内定时代替 AlarmManager/LocalNotifications：
- * MIUI/HyperOS 后台限制会掐掉 setRepeating 的本地通知，
- * 前台服务常驻后不依赖“自启动/省电无限制”等 ROM 设置。
- */
+/** Android delivery only. All transition times come from dsh-cost-meter on the host. */
 public class PeakReminderService extends Service {
-
-  private static final String CHANNEL_ID = "peak_remind";
-  private static final int FOREGROUND_NOTIFICATION_ID = 8810;
-  private static final String PREFS = "dsh_remote_peak";
-  private static final String KEY_LAST_PREFIX = "last_fired_";
-  private static final long CHECK_INTERVAL_MS = 30_000L;
-  // 服务被 Doze/系统调度延迟后，仍允许补发最近一次切换提醒。
-  private static final int CATCH_UP_WINDOW_SECONDS = 30 * 60;
-  private static final TimeZone BEIJING_TIME_ZONE = TimeZone.getTimeZone("Asia/Shanghai");
-  private static final String WEEKEND_REMINDER_TEXT = "今天是周末，谷时已到";
-
-  private static final Object[][] SLOTS = {
-      {8801, 9, 0, "进入峰时 9:00-12:00"},
-      {8802, 12, 0, "进入谷时 12:00-14:00"},
-      {8803, 14, 0, "进入峰时 14:00-18:00"},
-      {8804, 18, 0, "进入谷时 18:00-次日 9:00"},
-  };
-
+  static final String PREFS = "dsh_remote_peak";
+  private static final String FOREGROUND_CHANNEL = "dsh_remote_peak_receiver";
+  private static final String ALERT_CHANNEL = "dsh_remote_peak_events";
+  private static final int FOREGROUND_ID = 8810;
+  private static volatile boolean running = false;
+  private static long startingAt = 0;
   private HandlerThread thread;
   private Handler handler;
-  private volatile boolean stopped = false;
+  private volatile boolean stopped;
+  private volatile HttpURLConnection connection;
+  private long nextFetchAt;
+  private String foregroundTitle = "", foregroundBody = "";
 
-  @Override
-  public void onCreate() {
-    super.onCreate();
-    createChannel();
-    thread = new HandlerThread("PeakReminderService");
-    thread.start();
-    handler = new Handler(thread.getLooper());
-  }
-
-  @Override
-  public int onStartCommand(Intent intent, int flags, int startId) {
-    stopped = false;
-    startForegroundWithNotification();
-    if (handler != null) {
-      handler.removeCallbacksAndMessages(null);
-      handler.post(checkRunnable);
-    }
-    return START_STICKY;
-  }
-
-  @Override
-  public void onDestroy() {
-    stopped = true;
-    if (handler != null) handler.removeCallbacksAndMessages(null);
-    if (thread != null) thread.quitSafely();
-    super.onDestroy();
-  }
-
-  @Override
-  public IBinder onBind(Intent intent) {
-    return null;
-  }
-
-  private void createChannel() {
-    if (Build.VERSION.SDK_INT < 26) return;
-    NotificationChannel channel = new NotificationChannel(
-        CHANNEL_ID,
-        "峰谷提醒",
-        NotificationManager.IMPORTANCE_HIGH);
-    channel.setDescription("峰谷计费时段切换提醒");
-    NotificationManager nm = getSystemService(NotificationManager.class);
-    if (nm != null) nm.createNotificationChannel(channel);
-  }
-
-  private void startForegroundWithNotification() {
-    Notification notification = buildNotification(
-        "DSH Remote",
-        "峰谷提醒运行中",
-        true);
-    if (Build.VERSION.SDK_INT >= 29) {
-      startForeground(FOREGROUND_NOTIFICATION_ID, notification,
-          ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-    } else {
-      startForeground(FOREGROUND_NOTIFICATION_ID, notification);
-    }
-  }
-
-  private Notification buildNotification(String title, String text, boolean ongoing) {
-    Intent open = new Intent(this, MainActivity.class);
-    open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-    PendingIntent pi = PendingIntent.getActivity(
-        this, 0, open,
-        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-    Notification.Builder builder = Build.VERSION.SDK_INT >= 26
-        ? new Notification.Builder(this, CHANNEL_ID)
-        : new Notification.Builder(this);
-    builder.setSmallIcon(android.R.drawable.stat_notify_chat)
-        .setContentTitle(title)
-        .setContentText(text)
-        .setContentIntent(pi)
-        .setOngoing(ongoing);
-    return builder.build();
-  }
-
-  private final Runnable checkRunnable = new Runnable() {
-    @Override
-    public void run() {
-      if (stopped) return;
-      long nextDelay = checkAndNotify();
-      if (!stopped) handler.postDelayed(this, nextDelay);
-    }
-  };
-
-  private long checkAndNotify() {
-    Calendar now = Calendar.getInstance(BEIJING_TIME_ZONE);
-    int hour = now.get(Calendar.HOUR_OF_DAY);
-    int minute = now.get(Calendar.MINUTE);
-    int second = now.get(Calendar.SECOND);
-    int nowSeconds = hour * 3600 + minute * 60 + second;
-    SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
-    dateFormat.setTimeZone(BEIJING_TIME_ZONE);
-    String today = dateFormat.format(new Date(now.getTimeInMillis()));
-    SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-
-    boolean weekend = isWeekend(now);
-    for (int slotIndex = 0; slotIndex < SLOTS.length; slotIndex++) {
-      // 周六、周日全天均为谷时，只在 09:00 提醒一次，不再发送日内峰谷切换。
-      if (weekend && slotIndex != 0) continue;
-      Object[] slot = SLOTS[slotIndex];
-      int id = (Integer) slot[0];
-      int target = (Integer) slot[1] * 3600 + (Integer) slot[2] * 60;
-      if (nowSeconds < target || nowSeconds >= target + CATCH_UP_WINDOW_SECONDS) continue;
-      String key = KEY_LAST_PREFIX + id;
-      if (today.equals(prefs.getString(key, ""))) continue;
-      // 先同步占位再发通知，避免服务重启/进程崩溃落在 notify 与异步 apply 之间而重复发送。
-      if (!prefs.edit().putString(key, today).commit()) continue;
-      String text = weekend ? WEEKEND_REMINDER_TEXT : (String) slot[3];
-      if (!notifyPeak(id, text)) {
-        // 通知权限临时不可用时回滚，恢复权限后仍可在补发窗口内重试。
-        prefs.edit().remove(key).commit();
-      }
-    }
-    return nextCheckDelayMs(now);
-  }
-
-  /**
-   * 临近切换点时保持 30 秒检查；距离较远时只需等到下一个切换点。
-   * 即使系统把任务延后，下一次执行仍会通过补发窗口兜底。
-   */
-  private long nextCheckDelayMs(Calendar now) {
-    long nowMs = now.getTimeInMillis();
-    long nearestMs = Long.MAX_VALUE;
-    for (int dayOffset = 0; dayOffset <= 1; dayOffset++) {
-      for (int slotIndex = 0; slotIndex < SLOTS.length; slotIndex++) {
-        Object[] slot = SLOTS[slotIndex];
-        Calendar target = (Calendar) now.clone();
-        target.add(Calendar.DAY_OF_YEAR, dayOffset);
-        if (isWeekend(target) && slotIndex != 0) continue;
-        target.set(Calendar.HOUR_OF_DAY, (Integer) slot[1]);
-        target.set(Calendar.MINUTE, (Integer) slot[2]);
-        target.set(Calendar.SECOND, 0);
-        target.set(Calendar.MILLISECOND, 0);
-        long targetMs = target.getTimeInMillis();
-        if (targetMs > nowMs && targetMs < nearestMs) nearestMs = targetMs;
-      }
-    }
-    if (nearestMs == Long.MAX_VALUE) return CHECK_INTERVAL_MS;
-    return Math.max(1_000L, Math.min(CHECK_INTERVAL_MS, nearestMs - nowMs));
-  }
-
-  private boolean isWeekend(Calendar calendar) {
-    int day = calendar.get(Calendar.DAY_OF_WEEK);
-    return day == Calendar.SATURDAY || day == Calendar.SUNDAY;
-  }
-
-  private boolean notifyPeak(int id, String text) {
-    Notification notification = buildNotification("DSH Remote", text, false);
-    NotificationManager nm = getSystemService(NotificationManager.class);
-    if (nm == null) return false;
-    if (Build.VERSION.SDK_INT >= 24 && !nm.areNotificationsEnabled()) return false;
-    if (Build.VERSION.SDK_INT >= 26) {
-      NotificationChannel channel = nm.getNotificationChannel(CHANNEL_ID);
-      if (channel != null && channel.getImportance() == NotificationManager.IMPORTANCE_NONE) return false;
-    }
+  public static boolean isRunning() { return running; }
+  public static synchronized boolean restoreIfEnabled(Context context, boolean refresh) {
+    SharedPreferences p = context.getSharedPreferences(PREFS, MODE_PRIVATE);
+    if (!p.getBoolean("enabled", false) || p.getString("base", "").isEmpty() || p.getString("token", "").isEmpty()) return false;
+    long now = android.os.SystemClock.elapsedRealtime();
+    if (!refresh && (running || startingAt > 0 && now - startingAt < 10000)) return true;
+    startingAt = now;
     try {
-      nm.notify(id, notification);
+      Intent intent = new Intent(context, PeakReminderService.class);
+      if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent); else context.startService(intent);
       return true;
-    } catch (SecurityException ignored) {
+    } catch (RuntimeException error) {
+      startingAt = 0;
+      p.edit().putString("status", "start-failed").apply();
       return false;
     }
   }
+
+  @Override public void onCreate() {
+    super.onCreate();
+    NotificationManager nm = getSystemService(NotificationManager.class);
+    if (Build.VERSION.SDK_INT >= 26 && nm != null) {
+      nm.createNotificationChannel(new NotificationChannel(FOREGROUND_CHANNEL, "峰谷提醒后台接收", NotificationManager.IMPORTANCE_LOW));
+      nm.createNotificationChannel(new NotificationChannel(ALERT_CHANNEL, "峰谷计费提醒", NotificationManager.IMPORTANCE_HIGH));
+    }
+    thread = new HandlerThread("DshPeakReminders"); thread.start(); handler = new Handler(thread.getLooper());
+  }
+  private Notification notification(String channel, String title, String body, boolean ongoing) {
+    Intent open = new Intent(this, MainActivity.class).setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+    PendingIntent pi = PendingIntent.getActivity(this, 8810, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, channel) : new Notification.Builder(this);
+    return b.setSmallIcon(android.R.drawable.stat_notify_chat).setContentTitle(title).setContentText(body).setContentIntent(pi).setOngoing(ongoing).setAutoCancel(!ongoing).setOnlyAlertOnce(ongoing).setShowWhen(!ongoing).build();
+  }
+  @Override public int onStartCommand(Intent intent, int flags, int startId) {
+    SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+    if (!p.getBoolean("enabled", false)) { stopSelf(); return START_NOT_STICKY; }
+    try {
+      String[] content = foregroundContent(p, System.currentTimeMillis());
+      foregroundTitle = content[0]; foregroundBody = content[1];
+      Notification note = notification(FOREGROUND_CHANNEL, foregroundTitle, foregroundBody, true);
+      if (Build.VERSION.SDK_INT >= 29) startForeground(FOREGROUND_ID, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC); else startForeground(FOREGROUND_ID, note);
+      running = true; stopped = false; startingAt = 0; nextFetchAt = 0;
+      handler.removeCallbacksAndMessages(null); handler.post(check);
+      return START_STICKY;
+    } catch (RuntimeException error) {
+      p.edit().putString("status", "start-failed").apply(); running = false; startingAt = 0; stopSelf(); return START_NOT_STICKY;
+    }
+  }
+  private final Runnable check = new Runnable() { @Override public void run() {
+    if (stopped) return;
+    SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+    if (!p.getBoolean("enabled", false)) { stopSelf(); return; }
+    long now = System.currentTimeMillis();
+    if (now >= nextFetchAt) { nextFetchAt = now + 5 * 60000; refresh(p); }
+    if (!stopped) { long checkedAt = System.currentTimeMillis(); updateForeground(p, checkedAt); deliver(p, checkedAt); handler.postDelayed(this, 30000); }
+  }};
+  private String[] foregroundContent(SharedPreferences p, long now) {
+    String title = "峰谷状态未知", body = "等待同步 dsh-cost-meter 规则";
+    try {
+      JSONObject schedule = new JSONObject(p.getString("schedule", "{}"));
+      if (!schedule.optBoolean("enabled")) {
+        if ("plugin-disabled".equals(p.getString("status", ""))) body = "dsh-cost-meter 已关闭峰谷提醒";
+        else if ("plugin-unavailable".equals(p.getString("status", ""))) body = "dsh-cost-meter 规则暂不可用";
+      } else if (schedule.optLong("validUntil", 0) < now) body = "规则已过期，等待主机同步";
+      else {
+        JSONObject phase = schedule.optJSONObject("phase");
+        JSONArray transitions = phase == null ? null : phase.optJSONArray("transitions");
+        if (phase != null && phase.opt("intoPeak") instanceof Boolean && transitions != null && transitions.length() <= 512) {
+          long[] times = new long[transitions.length()]; boolean[] peaks = new boolean[transitions.length()];
+          for (int i = 0; i < times.length; i++) {
+            JSONObject entry = transitions.getJSONObject(i);
+            if (!(entry.opt("intoPeak") instanceof Boolean)) throw new Exception("phase");
+            times[i] = entry.getLong("at"); peaks[i] = entry.getBoolean("intoPeak");
+          }
+          int value = PeakReminderPolicy.phaseAt(now, schedule.optLong("generatedAt"), schedule.optLong("validUntil"), phase.getBoolean("intoPeak"), times, peaks);
+          title = PeakReminderPolicy.phaseLabel(value);
+          if (value >= 0) body = "offline".equals(p.getString("status", "")) ? "dsh-cost-meter · 离线，使用有效缓存规则" : "规则来自 dsh-cost-meter";
+        } else body = "主机尚未提供当前峰谷状态，请更新 Remote 插件";
+      }
+    } catch (Exception ignored) {}
+    return new String[] { "DSH Remote · " + title, body };
+  }
+  private void updateForeground(SharedPreferences p, long now) {
+    synchronized (PeakReminderService.class) {
+      if (stopped || !p.getBoolean("enabled", false)) return;
+      String[] content = foregroundContent(p, now);
+      if (content[0].equals(foregroundTitle) && content[1].equals(foregroundBody)) return;
+      NotificationManager nm = getSystemService(NotificationManager.class);
+      if (nm != null) {
+        try {
+          nm.notify(FOREGROUND_ID, notification(FOREGROUND_CHANNEL, content[0], content[1], true));
+          foregroundTitle = content[0]; foregroundBody = content[1];
+        } catch (RuntimeException ignored) { /* Keep checking rules if notifications are temporarily denied. */ }
+      }
+    }
+  }
+  private void refresh(SharedPreferences p) {
+    String base = p.getString("base", ""), token = p.getString("token", "");
+    HttpURLConnection c = null;
+    try {
+      URL url = new URL(base.replaceAll("/+$", "") + "/remote/api/insights/peak-reminders");
+      if (!"http".equals(url.getProtocol()) && !"https".equals(url.getProtocol())) throw new Exception("scheme");
+      c = (HttpURLConnection) url.openConnection(); connection = c;
+      c.setInstanceFollowRedirects(false); c.setConnectTimeout(10000); c.setReadTimeout(10000);
+      c.setRequestProperty("Authorization", "Bearer " + token); c.setRequestProperty("X-Dsh-Remote-Client", "app");
+      c.setRequestProperty("X-Dsh-Remote-Client-Id", p.getString("client_id", ""));
+      if (c.getResponseCode() != 200) throw new Exception("http");
+      byte[] bytes;
+      try (InputStream in = c.getInputStream(); java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+        byte[] buffer = new byte[4096]; int n;
+        while ((n = in.read(buffer)) != -1) { if (out.size() + n > 131072) throw new Exception("large"); out.write(buffer,0,n); }
+        bytes = out.toByteArray();
+      }
+      JSONObject data = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+      synchronized (PeakReminderService.class) {
+        if (stopped || !base.equals(p.getString("base", "")) || !token.equals(p.getString("token", ""))) return;
+        storeSchedule(p, data);
+      }
+    } catch (Exception error) { if (!stopped && base.equals(p.getString("base", "")) && token.equals(p.getString("token", ""))) p.edit().putString("status", "offline").apply(); }
+    finally { if (c != null) c.disconnect(); if (connection == c) connection = null; }
+  }
+  static boolean storeSchedule(SharedPreferences p, JSONObject data) {
+    long now = System.currentTimeMillis(), generated = data.optLong("generatedAt",0), validUntil = data.optLong("validUntil",0);
+    JSONArray events = data.optJSONArray("events");
+    if (!data.optBoolean("ok") || data.optInt("schema") != 1 || !"dsh-cost-meter".equals(data.optString("source")) || !data.optBoolean("available")) {
+      p.edit().remove("schedule").putString("status", "plugin-unavailable").apply(); return false;
+    }
+    if (generated > now + 5*60000 || generated < now - 86400000 || validUntil <= now || validUntil > generated + 8*86400000L || events == null || events.length() > 64) return false;
+    for (int i=0;i<events.length();i++) {
+      JSONObject e=events.optJSONObject(i);
+      if (e == null || e.optLong("at",0) <= 0 || e.optLong("at",0) > validUntil || !e.has("intoPeak") || e.optLong("notifyAt",0) <= 0 || e.optLong("notifyAt",0) > e.optLong("at",0) || e.optLong("at",0)-e.optLong("notifyAt",0) > 30*60000) return false;
+    }
+    p.edit().putString("schedule", data.toString()).putLong("last_sync_at",now).putString("status",data.optBoolean("enabled")?"ready":"plugin-disabled").apply(); return true;
+  }
+  private void deliver(SharedPreferences p, long now) {
+    synchronized (PeakReminderService.class) {
+      if (stopped || !p.getBoolean("enabled",false)) return;
+      try {
+        JSONObject schedule = new JSONObject(p.getString("schedule", "{}"));
+        if (!schedule.optBoolean("enabled")) return;
+        JSONArray events = schedule.optJSONArray("events"); if (events == null) return;
+        for (int i=0;i<events.length();i++) {
+          JSONObject e=events.optJSONObject(i); if(e==null) continue;
+          long at=e.optLong("at"), notifyAt=e.optLong("notifyAt");
+          if (!PeakReminderPolicy.isDue(now,notifyAt,at,schedule.optLong("validUntil"),p.getLong("last_fired_at",0))) continue;
+          NotificationManager nm=getSystemService(NotificationManager.class);
+          if(nm==null || Build.VERSION.SDK_INT>=24 && !nm.areNotificationsEnabled()) return;
+          if(Build.VERSION.SDK_INT>=26 && nm.getNotificationChannel(ALERT_CHANNEL)!=null && nm.getNotificationChannel(ALERT_CHANNEL).getImportance()==NotificationManager.IMPORTANCE_NONE) return;
+          SimpleDateFormat format=new SimpleDateFormat("MM-dd HH:mm",Locale.CHINA); format.setTimeZone(TimeZone.getTimeZone("Asia/Shanghai"));
+          boolean peak=e.optBoolean("intoPeak"); String phase=peak?"峰时":"谷时";
+          nm.notify(peak?8811:8812,notification(ALERT_CHANNEL,"DSH Remote · "+(now<at?"即将进入":"已进入")+phase,
+              format.format(new Date(at))+"（北京时间）· dsh-cost-meter",false));
+          p.edit().putLong("last_fired_at",at).apply();
+        }
+      } catch(Exception ignored) {}
+    }
+  }
+  @Override public void onTimeout(int startId,int type) { stopped=true;running=false;getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("status","system-timeout").apply();stopForeground(true);stopSelf(); }
+  @Override public void onDestroy() { stopped=true;running=false;startingAt=0;if(handler!=null)handler.removeCallbacksAndMessages(null);if(connection!=null)connection.disconnect();if(thread!=null)thread.quitSafely();super.onDestroy(); }
+  @Override public IBinder onBind(Intent intent) { return null; }
 }
